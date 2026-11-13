@@ -1,4 +1,4 @@
-/* $OpenBSD$ */
+/* $OpenBSD: cmd-find.c,v 1.90 2026/11/12 18:15:51 nicm Exp $ */
 
 /*
  * Copyright (c) 2015 Nicholas Marriott <nicholas.marriott@gmail.com>
@@ -54,6 +54,7 @@ static const char *cmd_find_window_table[][2] = {
 	{ "{end}", "$" },
 	{ "{next}", "+" },
 	{ "{previous}", "-" },
+	{ "{current}", "@" },
 	{ NULL, NULL }
 };
 static const char *cmd_find_pane_table[][2] = {
@@ -147,6 +148,18 @@ cmd_find_session_better(struct session *s, struct session *than, int flags)
 	return (timercmp(&s->activity_time, &than->activity_time, >));
 }
 
+/* Can this session be usefully targeted? */
+static int
+cmd_find_session_valid(struct session *s)
+{
+	if (!session_alive(s) ||
+	    s->curw == NULL ||
+	    s->curw->window == NULL ||
+	    s->curw->window->active == NULL)
+		return (0);
+	return (1);
+}
+
 /* Find best session from a list, or all if list is NULL. */
 static struct session *
 cmd_find_best_session(struct session **slist, u_int ssize, int flags)
@@ -159,11 +172,15 @@ cmd_find_best_session(struct session **slist, u_int ssize, int flags)
 	s = NULL;
 	if (slist != NULL) {
 		for (i = 0; i < ssize; i++) {
+			if (!cmd_find_session_valid(slist[i]))
+				continue;
 			if (cmd_find_session_better(slist[i], s, flags))
 				s = slist[i];
 		}
 	} else {
 		RB_FOREACH(s_loop, sessions, &sessions) {
+			if (!cmd_find_session_valid(s_loop))
+				continue;
 			if (cmd_find_session_better(s_loop, s, flags))
 				s = s_loop;
 		}
@@ -313,8 +330,11 @@ cmd_find_get_window(struct cmd_find_state *fs, const char *window, int only)
 {
 	log_debug("%s: %s", __func__, window);
 
-	/* Check for window ids starting with @. */
-	if (*window == '@') {
+	/*
+	 * Check for window ids starting with @. A bare @ is the current window
+	 * token, which is handled later.
+	 */
+	if (window[0] == '@' && window[1] != '\0') {
 		fs->w = window_find_by_id_str(window);
 		if (fs->w == NULL)
 			return (-1);
@@ -362,6 +382,15 @@ cmd_find_get_window_with_session(struct cmd_find_state *fs, const char *window)
 	fs->wl = fs->s->curw;
 	fs->w = fs->wl->window;
 
+	/*
+	 * A bare @ is the current window, which is already the default. This
+	 * must come before the window id check.
+	 */
+	if (!exact && strcmp(window, "@") == 0) {
+		fs->idx = fs->wl->idx;
+		return (0);
+	}
+
 	/* Check for window ids starting with @. */
 	if (*window == '@') {
 		fs->w = window_find_by_id_str(window);
@@ -372,9 +401,11 @@ cmd_find_get_window_with_session(struct cmd_find_state *fs, const char *window)
 
 	/* Try as an offset. */
 	if (!exact && (window[0] == '+' || window[0] == '-')) {
-		if (window[1] != '\0')
-			n = strtonum(window + 1, 1, INT_MAX, NULL);
-		else
+		if (window[1] != '\0') {
+			n = strtonum(window + 1, 1, INT_MAX, &errstr);
+			if (errstr != NULL)
+				return (-1);
+		} else
 			n = 1;
 		s = fs->s;
 		if (fs->flags & CMD_FIND_WINDOW_INDEX) {
@@ -582,27 +613,27 @@ cmd_find_get_pane_with_window(struct cmd_find_state *fs, const char *pane)
 
 	/* Try special characters. */
 	if (strcmp(pane, "!") == 0) {
-		fs->wp = fs->w->last;
+		fs->wp = TAILQ_FIRST(&fs->w->last_panes);
 		if (fs->wp == NULL)
 			return (-1);
 		return (0);
 	} else if (strcmp(pane, "{up-of}") == 0) {
-		fs->wp = window_pane_find_up(fs->current->wp);
+		fs->wp = window_pane_find_up(fs->w->active);
 		if (fs->wp == NULL)
 			return (-1);
 		return (0);
 	} else if (strcmp(pane, "{down-of}") == 0) {
-		fs->wp = window_pane_find_down(fs->current->wp);
+		fs->wp = window_pane_find_down(fs->w->active);
 		if (fs->wp == NULL)
 			return (-1);
 		return (0);
 	} else if (strcmp(pane, "{left-of}") == 0) {
-		fs->wp = window_pane_find_left(fs->current->wp);
+		fs->wp = window_pane_find_left(fs->w->active);
 		if (fs->wp == NULL)
 			return (-1);
 		return (0);
 	} else if (strcmp(pane, "{right-of}") == 0) {
-		fs->wp = window_pane_find_right(fs->current->wp);
+		fs->wp = window_pane_find_right(fs->w->active);
 		if (fs->wp == NULL)
 			return (-1);
 		return (0);
@@ -610,11 +641,13 @@ cmd_find_get_pane_with_window(struct cmd_find_state *fs, const char *pane)
 
 	/* Try as an offset. */
 	if (pane[0] == '+' || pane[0] == '-') {
-		if (pane[1] != '\0')
-			n = strtonum(pane + 1, 1, INT_MAX, NULL);
-		else
+		if (pane[1] != '\0') {
+			n = strtonum(pane + 1, 1, INT_MAX, &errstr);
+			if (errstr != NULL)
+				return (-1);
+		} else
 			n = 1;
-		wp = fs->current->wp;
+		wp = fs->w->active;
 		if (pane[0] == '+')
 			fs->wp = window_pane_next_by_number(fs->w, wp, n);
 		else
@@ -868,7 +901,7 @@ cmd_find_from_client(struct cmd_find_state *fs, struct client *c, int flags)
 	if (c->session != NULL) {
 		cmd_find_clear_state(fs, flags);
 
-		fs->wp = server_client_get_pane(c);
+		fs->wp = c->session->curw->window->active;
 		if (fs->wp == NULL) {
 			cmd_find_from_session(fs, c->session, flags);
 			return (0);
@@ -924,6 +957,7 @@ cmd_find_target(struct cmd_find_state *fs, struct cmdq_item *item,
     const char *target, enum cmd_find_type type, int flags)
 {
 	struct mouse_event	*m;
+	struct client		*c;
 	struct cmd_find_state	 current;
 	char			*colon, *period, *copy = NULL, tmp[256];
 	const char		*session, *window, *pane, *s;
@@ -989,6 +1023,21 @@ cmd_find_target(struct cmd_find_state *fs, struct cmdq_item *item,
 	/* An empty or NULL target is the current. */
 	if (target == NULL || *target == '\0')
 		goto current;
+
+	if (strcmp(target, "@") == 0 ||
+	    strcmp(target, "{active}") == 0 ||
+	    strcmp(target, "{current}") == 0) {
+		c = cmdq_get_client(item);
+		if (c == NULL || c->session == NULL) {
+			cmdq_error(item, "no current client");
+			goto error;
+		}
+		fs->s = c->session;
+		fs->wl = c->session->curw;
+		fs->wp = c->session->curw->window->active;
+		fs->w = c->session->curw->window;
+		goto found;
+	}
 
 	/* Mouse target is a plain = or {mouse}. */
 	if (strcmp(target, "=") == 0 || strcmp(target, "{mouse}") == 0) {

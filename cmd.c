@@ -1,4 +1,4 @@
-/* $OpenBSD$ */
+/* $OpenBSD: cmd.c,v 1.190 2026/10/16 07:59:06 nicm Exp $ */
 
 /*
  * Copyright (c) 2007 Nicholas Marriott <nicholas.marriott@gmail.com>
@@ -47,7 +47,6 @@ extern const struct cmd_entry cmd_display_menu_entry;
 extern const struct cmd_entry cmd_display_message_entry;
 extern const struct cmd_entry cmd_display_popup_entry;
 extern const struct cmd_entry cmd_display_panes_entry;
-extern const struct cmd_entry cmd_down_pane_entry;
 extern const struct cmd_entry cmd_find_window_entry;
 extern const struct cmd_entry cmd_has_session_entry;
 extern const struct cmd_entry cmd_if_shell_entry;
@@ -72,6 +71,7 @@ extern const struct cmd_entry cmd_lock_server_entry;
 extern const struct cmd_entry cmd_lock_session_entry;
 extern const struct cmd_entry cmd_move_pane_entry;
 extern const struct cmd_entry cmd_move_window_entry;
+extern const struct cmd_entry cmd_new_pane_entry;
 extern const struct cmd_entry cmd_new_session_entry;
 extern const struct cmd_entry cmd_new_window_entry;
 extern const struct cmd_entry cmd_next_layout_entry;
@@ -115,9 +115,9 @@ extern const struct cmd_entry cmd_suspend_client_entry;
 extern const struct cmd_entry cmd_swap_pane_entry;
 extern const struct cmd_entry cmd_swap_window_entry;
 extern const struct cmd_entry cmd_switch_client_entry;
+extern const struct cmd_entry cmd_switch_mode_entry;
 extern const struct cmd_entry cmd_unbind_key_entry;
 extern const struct cmd_entry cmd_unlink_window_entry;
-extern const struct cmd_entry cmd_up_pane_entry;
 extern const struct cmd_entry cmd_wait_for_entry;
 
 const struct cmd_entry *cmd_table[] = {
@@ -165,6 +165,7 @@ const struct cmd_entry *cmd_table[] = {
 	&cmd_lock_session_entry,
 	&cmd_move_pane_entry,
 	&cmd_move_window_entry,
+	&cmd_new_pane_entry,
 	&cmd_new_session_entry,
 	&cmd_new_window_entry,
 	&cmd_next_layout_entry,
@@ -208,6 +209,7 @@ const struct cmd_entry *cmd_table[] = {
 	&cmd_swap_pane_entry,
 	&cmd_swap_window_entry,
 	&cmd_switch_client_entry,
+	&cmd_switch_mode_entry,
 	&cmd_unbind_key_entry,
 	&cmd_unlink_window_entry,
 	&cmd_wait_for_entry,
@@ -222,6 +224,7 @@ struct cmd {
 
 	char			 *file;
 	u_int			  line;
+	int			  parse_flags;
 
 	TAILQ_ENTRY(cmd)	  qentry;
 };
@@ -304,6 +307,8 @@ cmd_unpack_argv(char *buf, size_t len, int argc, char ***argv)
 
 	if (argc == 0)
 		return (0);
+	if (argc < 0 || argc > 1000)
+		return (-1);
 	*argv = xcalloc(argc, sizeof **argv);
 
 	buf[len - 1] = '\0';
@@ -414,6 +419,13 @@ cmd_get_source(struct cmd *cmd, const char **file, u_int *line)
 		*line = cmd->line;
 }
 
+/* Get parse flags for command. */
+int
+cmd_get_parse_flags(struct cmd *cmd)
+{
+	return (cmd->parse_flags);
+}
+
 /* Look for an alias for a command. */
 char *
 cmd_get_alias(const char *name)
@@ -446,7 +458,7 @@ cmd_get_alias(const char *name)
 }
 
 /* Look up a command entry by name. */
-static const struct cmd_entry *
+const struct cmd_entry *
 cmd_find(const char *name, char **cause)
 {
 	const struct cmd_entry	**loop, *entry, *found = NULL;
@@ -498,7 +510,7 @@ ambiguous:
 /* Parse a single command from an argument vector. */
 struct cmd *
 cmd_parse(struct args_value *values, u_int count, const char *file, u_int line,
-    char **cause)
+    int parse_flags, char **cause)
 {
 	const struct cmd_entry	*entry;
 	struct cmd		*cmd;
@@ -527,6 +539,7 @@ cmd_parse(struct args_value *values, u_int count, const char *file, u_int line,
 	cmd = xcalloc(1, sizeof *cmd);
 	cmd->entry = entry;
 	cmd->args = args;
+	cmd->parse_flags = parse_flags;
 
 	if (file != NULL)
 		cmd->file = xstrdup(file);
@@ -638,7 +651,7 @@ cmd_list_free(struct cmd_list *cmdlist)
 
 /* Copy a command list, expanding %s in arguments. */
 struct cmd_list *
-cmd_list_copy(struct cmd_list *cmdlist, int argc, char **argv)
+cmd_list_copy(const struct cmd_list *cmdlist, int argc, char **argv)
 {
 	struct cmd	*cmd;
 	struct cmd_list	*new_cmdlist;
@@ -669,11 +682,16 @@ cmd_list_copy(struct cmd_list *cmdlist, int argc, char **argv)
 
 /* Get a command list as a string. */
 char *
-cmd_list_print(struct cmd_list *cmdlist, int escaped)
+cmd_list_print(const struct cmd_list *cmdlist, int flags)
 {
 	struct cmd	*cmd, *next;
 	char		*buf, *this;
 	size_t		 len;
+	const char	*separator;
+	int		 escaped = flags & CMD_LIST_PRINT_ESCAPED;
+	int		 no_groups = flags & CMD_LIST_PRINT_NO_GROUPS;
+	const char	*single_separator = escaped ? " \\; " : " ; ";
+	const char	*double_separator = escaped ? " \\;\\; " : " ;; ";
 
 	len = 1;
 	buf = xcalloc(1, len);
@@ -688,17 +706,11 @@ cmd_list_print(struct cmd_list *cmdlist, int escaped)
 
 		next = TAILQ_NEXT(cmd, qentry);
 		if (next != NULL) {
-			if (cmd->group != next->group) {
-				if (escaped)
-					strlcat(buf, " \\;\\; ", len);
-				else
-					strlcat(buf, " ;; ", len);
-			} else {
-				if (escaped)
-					strlcat(buf, " \\; ", len);
-				else
-					strlcat(buf, " ; ", len);
-			}
+			if (!no_groups && cmd->group != next->group)
+				separator = double_separator;
+			else
+				separator = single_separator;
+			strlcat(buf, separator, len);
 		}
 
 		free(this);
@@ -765,10 +777,12 @@ cmd_mouse_at(struct window_pane *wp, struct mouse_event *m, u_int *xp,
 
 	if (m->statusat == 0 && y >= m->statuslines)
 		y -= m->statuslines;
+	if (m->sideat == 0 && x >= m->sidewidth)
+		x -= m->sidewidth;
 
-	if (x < wp->xoff || x >= wp->xoff + wp->sx)
+	if ((int)x < wp->xoff || (int)x >= wp->xoff + (int)wp->sx)
 		return (-1);
-	if (y < wp->yoff || y >= wp->yoff + wp->sy)
+	if ((int)y < wp->yoff || (int)y >= wp->yoff + (int)wp->sy)
 		return (-1);
 
 	if (xp != NULL)
@@ -812,9 +826,15 @@ cmd_mouse_pane(struct mouse_event *m, struct session **sp,
 
 	if ((wl = cmd_mouse_window(m, sp)) == NULL)
 		return (NULL);
-	if ((wp = window_pane_find_by_id(m->wp)) == NULL)
-		return (NULL);
-	if (!window_has_pane(wl->window, wp))
+	if (m->wp == -1)
+		wp = wl->window->active;
+	else {
+		if ((wp = window_pane_find_by_id(m->wp)) == NULL)
+			return (NULL);
+		if (!window_has_pane(wl->window, wp))
+			return (NULL);
+	}
+	if (wl->window->modal != NULL && wp != wl->window->modal)
 		return (NULL);
 
 	if (wlp != NULL)
@@ -822,14 +842,19 @@ cmd_mouse_pane(struct mouse_event *m, struct session **sp,
 	return (wp);
 }
 
-/* Replace the first %% or %idx in template by s. */
+/*
+ * Replace the first %% or any %idx in template by s. %% is intended for use in
+ * single quotes, so ' is escaped. %%% and %idx% are for double quotes, so a
+ * list of special characters is escaped. %idx is left unescaped.
+ */
 char *
 cmd_template_replace(const char *template, const char *s, int idx)
 {
-	char		 ch, *buf;
-	const char	*ptr, *cp, quote[] = "\"\\$;~";
-	int		 replaced, quoted;
-	size_t		 len;
+	char			 ch, *buf;
+	const char		*ptr, *cp, dquote[] = "\"\\$;~";
+	int			 replaced;
+	size_t			 len, slen;
+	enum { NQ, SQ, DQ }	 quote;
 
 	if (strchr(template, '%') == NULL)
 		return (xstrdup(template));
@@ -843,30 +868,52 @@ cmd_template_replace(const char *template, const char *s, int idx)
 	while (*ptr != '\0') {
 		switch (ch = *ptr++) {
 		case '%':
-			if (*ptr < '1' || *ptr > '9' || *ptr - '0' != idx) {
+			if (*ptr >= '1' && *ptr <= '9' && *ptr - '0' == idx) {
+				ptr++;
+				quote = NQ;
+				if (*ptr == '%') {
+					quote = DQ;
+					ptr++;
+				}
+			} else {
 				if (*ptr != '%' || replaced)
 					break;
 				replaced = 1;
-			}
-			ptr++;
-
-			quoted = (*ptr == '%');
-			if (quoted)
 				ptr++;
+				quote = SQ;
+				if (*ptr == '%') {
+					quote = DQ;
+					ptr++;
+				}
+			}
 
-			buf = xrealloc(buf, len + (strlen(s) * 3) + 1);
+			slen = strlen(s);
+			if (slen >= SIZE_MAX / 4 ||
+			    len > SIZE_MAX - (slen * 4) - 1)
+				fatalx("argument too long");
+			buf = xrealloc(buf, len + (slen * 4) + 1);
 			for (cp = s; *cp != '\0'; cp++) {
-				if (quoted && strchr(quote, *cp) != NULL)
+				if (quote == SQ && *cp == '\'') {
+					buf[len++] = '\'';
+					buf[len++] = '\\';
+					buf[len++] = '\'';
+					buf[len++] = '\'';
+					continue;
+				}
+				if (quote == DQ && strchr(dquote, *cp) != NULL)
 					buf[len++] = '\\';
 				buf[len++] = *cp;
 			}
 			buf[len] = '\0';
 			continue;
 		}
+		if (len > SIZE_MAX - 2)
+			fatalx("argument too long");
 		buf = xrealloc(buf, len + 2);
 		buf[len++] = ch;
 		buf[len] = '\0';
 	}
 
+	log_debug("%s: %s -> %s", __func__, template, buf);
 	return (buf);
 }

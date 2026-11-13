@@ -18,6 +18,7 @@
 #include <sys/socket.h>
 
 #include <stdio.h>
+#include <unistd.h>
 
 #ifdef HAVE_UCRED_H
 #include <ucred.h>
@@ -30,7 +31,7 @@ getpeereid(int s, uid_t *uid, gid_t *gid)
 {
 #ifdef HAVE_SO_PEERCRED
 	struct ucred	uc;
-	int		len = sizeof uc;
+	socklen_t	len = sizeof uc;
 
 	if (getsockopt(s, SOL_SOCKET, SO_PEERCRED, &uc, &len) == -1)
 		return (-1);
@@ -49,6 +50,8 @@ getpeereid(int s, uid_t *uid, gid_t *gid)
         ucred_free(ucred);
         return (0);
 #else
-	return (getuid());
+	*uid = geteuid();
+	*gid = getegid();
+	return (0);
 #endif
 }

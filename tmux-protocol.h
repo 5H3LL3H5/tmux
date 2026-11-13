@@ -1,4 +1,4 @@
-/* $OpenBSD$ */
+/* $OpenBSD: tmux-protocol.h,v 1.3 2026/08/17 07:56:56 nicm Exp $ */
 
 /*
  * Copyright (c) 2021 Nicholas Marriott <nicholas.marriott@gmail.com>
@@ -66,7 +66,9 @@ enum msgtype {
 	MSG_WRITE_OPEN,
 	MSG_WRITE,
 	MSG_WRITE_READY,
-	MSG_WRITE_CLOSE
+	MSG_WRITE_CLOSE,
+	MSG_READ_CANCEL,
+	MSG_WRITE_DONE
 };
 
 /*
@@ -92,6 +94,10 @@ struct msg_read_done {
 	int	error;
 };
 
+struct msg_read_cancel {
+	int	stream;
+};
+
 struct msg_write_open {
 	int	stream;
 	int	fd;
@@ -109,6 +115,11 @@ struct msg_write_ready {
 
 struct msg_write_close {
 	int	stream;
+};
+
+struct msg_write_done {
+	int	stream;
+	int	error;
 };
 
 #endif /* TMUX_PROTOCOL_H */

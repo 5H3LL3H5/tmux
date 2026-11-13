@@ -1,4 +1,4 @@
-/* $OpenBSD$ */
+/* $OpenBSD: tty-features.c,v 1.53 2026/11/10 10:47:11 nicm Exp $ */
 
 /*
  * Copyright (c) 2020 Nicholas Marriott <nicholas.marriott@gmail.com>
@@ -21,6 +21,12 @@
 #include <stdlib.h>
 #include <string.h>
 
+#if defined(HAVE_CURSES_H)
+#include <curses.h>
+#elif defined(HAVE_NCURSES_H)
+#include <ncurses.h>
+#endif
+
 #include "tmux.h"
 
 /*
@@ -36,13 +42,13 @@
 
 /* A named terminal feature. */
 struct tty_feature {
-	const char	 *name;
-	const char	**capabilities;
-	int		  flags;
+	const char		*name;
+	const char *const	*capabilities;
+	int			 flags;
 };
 
 /* Terminal has xterm(1) title setting. */
-static const char *tty_feature_title_capabilities[] = {
+static const char *const tty_feature_title_capabilities[] = {
 	"tsl=\\E]0;", /* should be using TS really */
 	"fsl=\\a",
 	NULL
@@ -54,7 +60,7 @@ static const struct tty_feature tty_feature_title = {
 };
 
 /* Terminal has OSC 7 working directory. */
-static const char *tty_feature_osc7_capabilities[] = {
+static const char *const tty_feature_osc7_capabilities[] = {
 	"Swd=\\E]7;",
 	"fsl=\\a",
 	NULL
@@ -66,7 +72,7 @@ static const struct tty_feature tty_feature_osc7 = {
 };
 
 /* Terminal has mouse support. */
-static const char *tty_feature_mouse_capabilities[] = {
+static const char *const tty_feature_mouse_capabilities[] = {
 	"kmous=\\E[M",
 	NULL
 };
@@ -77,7 +83,7 @@ static const struct tty_feature tty_feature_mouse = {
 };
 
 /* Terminal can set the clipboard with OSC 52. */
-static const char *tty_feature_clipboard_capabilities[] = {
+static const char *const tty_feature_clipboard_capabilities[] = {
 	"Ms=\\E]52;%p1%s;%p2%s\\a",
 	NULL
 };
@@ -92,7 +98,7 @@ static const char *tty_feature_hyperlinks_capabilities[] = {
 #if defined (__OpenBSD__) || (defined(NCURSES_VERSION_MAJOR) && \
 	(NCURSES_VERSION_MAJOR > 5 || \
 	(NCURSES_VERSION_MAJOR == 5 && NCURSES_VERSION_MINOR > 8)))
-	"*:Hls=\\E]8;%?%p1%l%tid=%p1%s%;;%p2%s\\E\\\\",
+	"Hls=\\E]8;%?%p1%l%tid=%p1%s%;;%p2%s\\E\\\\",
 #endif
 	NULL
 };
@@ -107,7 +113,7 @@ static const struct tty_feature tty_feature_hyperlinks = {
  * terminals with RGB have versions that do not allow setting colours from the
  * 256 palette.
  */
-static const char *tty_feature_rgb_capabilities[] = {
+static const char *const tty_feature_rgb_capabilities[] = {
 	"AX",
 	"setrgbf=\\E[38;2;%p1%d;%p2%d;%p3%dm",
 	"setrgbb=\\E[48;2;%p1%d;%p2%d;%p3%dm",
@@ -122,7 +128,7 @@ static const struct tty_feature tty_feature_rgb = {
 };
 
 /* Terminal supports 256 colours. */
-static const char *tty_feature_256_capabilities[] = {
+static const char *const tty_feature_256_capabilities[] = {
 	"AX",
 	"setab=\\E[%?%p1%{8}%<%t4%p1%d%e%p1%{16}%<%t10%p1%{8}%-%d%e48;5;%p1%d%;m",
 	"setaf=\\E[%?%p1%{8}%<%t3%p1%d%e%p1%{16}%<%t9%p1%{8}%-%d%e38;5;%p1%d%;m",
@@ -135,7 +141,7 @@ static const struct tty_feature tty_feature_256 = {
 };
 
 /* Terminal supports overline. */
-static const char *tty_feature_overline_capabilities[] = {
+static const char *const tty_feature_overline_capabilities[] = {
 	"Smol=\\E[53m",
 	NULL
 };
@@ -146,9 +152,10 @@ static const struct tty_feature tty_feature_overline = {
 };
 
 /* Terminal supports underscore styles. */
-static const char *tty_feature_usstyle_capabilities[] = {
+static const char *const tty_feature_usstyle_capabilities[] = {
 	"Smulx=\\E[4::%p1%dm",
 	"Setulc=\\E[58::2::%p1%{65536}%/%d::%p1%{256}%/%{255}%&%d::%p1%{255}%&%d%;m",
+	"Setulc1=\\E[58::5::%p1%dm",
 	"ol=\\E[59m",
 	NULL
 };
@@ -159,7 +166,7 @@ static const struct tty_feature tty_feature_usstyle = {
 };
 
 /* Terminal supports bracketed paste. */
-static const char *tty_feature_bpaste_capabilities[] = {
+static const char *const tty_feature_bpaste_capabilities[] = {
 	"Enbp=\\E[?2004h",
 	"Dsbp=\\E[?2004l",
 	NULL
@@ -171,7 +178,7 @@ static const struct tty_feature tty_feature_bpaste = {
 };
 
 /* Terminal supports focus reporting. */
-static const char *tty_feature_focus_capabilities[] = {
+static const char *const tty_feature_focus_capabilities[] = {
 	"Enfcs=\\E[?1004h",
 	"Dsfcs=\\E[?1004l",
 	NULL
@@ -182,8 +189,20 @@ static const struct tty_feature tty_feature_focus = {
 	0
 };
 
+/* Terminal supports application escape key mode. */
+static const char *const tty_feature_appesc_capabilities[] = {
+	"Enesc=\\E[?7727h",
+	"Dsesc=\\E[?7727l",
+	NULL
+};
+static const struct tty_feature tty_feature_appesc = {
+	"appesc",
+	tty_feature_appesc_capabilities,
+	0
+};
+
 /* Terminal supports cursor styles. */
-static const char *tty_feature_cstyle_capabilities[] = {
+static const char *const tty_feature_cstyle_capabilities[] = {
 	"Ss=\\E[%p1%d q",
 	"Se=\\E[2 q",
 	NULL
@@ -191,11 +210,11 @@ static const char *tty_feature_cstyle_capabilities[] = {
 static const struct tty_feature tty_feature_cstyle = {
 	"cstyle",
 	tty_feature_cstyle_capabilities,
-	0
+	TERM_NOREPLACE
 };
 
 /* Terminal supports cursor colours. */
-static const char *tty_feature_ccolour_capabilities[] = {
+static const char *const tty_feature_ccolour_capabilities[] = {
 	"Cs=\\E]12;%p1%s\\a",
 	"Cr=\\E]112\\a",
 	NULL
@@ -207,7 +226,7 @@ static const struct tty_feature tty_feature_ccolour = {
 };
 
 /* Terminal supports strikethrough. */
-static const char *tty_feature_strikethrough_capabilities[] = {
+static const char *const tty_feature_strikethrough_capabilities[] = {
 	"smxx=\\E[9m",
 	NULL
 };
@@ -218,8 +237,8 @@ static const struct tty_feature tty_feature_strikethrough = {
 };
 
 /* Terminal supports synchronized updates. */
-static const char *tty_feature_sync_capabilities[] = {
-	"Sync=\\EP=%p1%ds\\E\\\\",
+static const char *const tty_feature_sync_capabilities[] = {
+	"Sync=\\E[?2026%?%p1%{1}%-%tl%eh%;",
 	NULL
 };
 static const struct tty_feature tty_feature_sync = {
@@ -229,8 +248,8 @@ static const struct tty_feature tty_feature_sync = {
 };
 
 /* Terminal supports extended keys. */
-static const char *tty_feature_extkeys_capabilities[] = {
-	"Eneks=\\E[>4;1m",
+static const char *const tty_feature_extkeys_capabilities[] = {
+	"Eneks=\\E[>4;2m",
 	"Dseks=\\E[>4m",
 	NULL
 };
@@ -241,7 +260,7 @@ static const struct tty_feature tty_feature_extkeys = {
 };
 
 /* Terminal supports DECSLRM margins. */
-static const char *tty_feature_margins_capabilities[] = {
+static const char *const tty_feature_margins_capabilities[] = {
 	"Enmg=\\E[?69h",
 	"Dsmg=\\E[?69l",
 	"Clmg=\\E[s",
@@ -255,7 +274,7 @@ static const struct tty_feature tty_feature_margins = {
 };
 
 /* Terminal supports DECFRA rectangle fill. */
-static const char *tty_feature_rectfill_capabilities[] = {
+static const char *const tty_feature_rectfill_capabilities[] = {
 	"Rect",
 	NULL
 };
@@ -266,7 +285,7 @@ static const struct tty_feature tty_feature_rectfill = {
 };
 
 /* Use builtin function keys only. */
-static const char *tty_feature_ignorefkeys_capabilities[] = {
+static const char *const tty_feature_ignorefkeys_capabilities[] = {
 	"kf0@",
 	"kf1@",
 	"kf2@",
@@ -339,9 +358,57 @@ static const struct tty_feature tty_feature_ignorefkeys = {
 	0
 };
 
+/* Terminal has sixel capability. */
+static const char *const tty_feature_sixel_capabilities[] = {
+	"Sxl",
+	NULL
+};
+static const struct tty_feature tty_feature_sixel = {
+	"sixel",
+	tty_feature_sixel_capabilities,
+	TERM_SIXEL
+};
+
+/* Terminal supports the Kitty graphics protocol. */
+static const struct tty_feature tty_feature_kittygraphics = {
+	"kittygraphics",
+	NULL,
+	TERM_KITTYGRAPHICS
+};
+
+/* Terminal moves images with scroll regions. */
+static const char *const tty_feature_imagescroll_capabilities[] = {
+	"Iscrl",
+	NULL
+};
+static const struct tty_feature tty_feature_imagescroll = {
+	"imagescroll",
+	tty_feature_imagescroll_capabilities,
+	0
+};
+
+/* Terminal supports the OSC 9;4 progress bar. */
+static const char *const tty_feature_progressbar_capabilities[] = {
+	"Spb=\\E]9;4;%p1%d;%p2%d\\E\\\\",
+	NULL
+};
+static const struct tty_feature tty_feature_progressbar = {
+	"progressbar",
+	tty_feature_progressbar_capabilities,
+	0
+};
+
+/* Terminal supports UTF-8. */
+static const struct tty_feature tty_feature_utf8 = {
+	"utf8",
+	NULL,
+	0
+};
+
 /* Available terminal features. */
-static const struct tty_feature *tty_features[] = {
+static const struct tty_feature *const tty_features[] = {
 	&tty_feature_256,
+	&tty_feature_appesc,
 	&tty_feature_bpaste,
 	&tty_feature_ccolour,
 	&tty_feature_clipboard,
@@ -350,29 +417,46 @@ static const struct tty_feature *tty_features[] = {
 	&tty_feature_extkeys,
 	&tty_feature_focus,
 	&tty_feature_ignorefkeys,
+	&tty_feature_imagescroll,
+	&tty_feature_kittygraphics,
 	&tty_feature_margins,
 	&tty_feature_mouse,
 	&tty_feature_osc7,
 	&tty_feature_overline,
+	&tty_feature_progressbar,
 	&tty_feature_rectfill,
 	&tty_feature_rgb,
+	&tty_feature_sixel,
 	&tty_feature_strikethrough,
 	&tty_feature_sync,
 	&tty_feature_title,
-	&tty_feature_usstyle
+	&tty_feature_usstyle,
+	&tty_feature_utf8
 };
 
+/* Parse features for client. */
 void
-tty_add_features(int *feat, const char *s, const char *separators)
+tty_parse_client_features(struct client *c, const char *s, const char *sep)
+{
+	tty_parse_features(s, sep, &c->term_features, &c->term_nofeatures);
+}
+
+/* Parse features list. */
+void
+tty_parse_features(const char *s, const char *sep, int *enabled, int *disabled)
 {
 	const struct tty_feature	 *tf;
 	char				 *next, *loop, *copy;
 	u_int				  i;
+	int				  remove;
 
 	log_debug("adding terminal features %s", s);
 
 	loop = copy = xstrdup(s);
-	while ((next = strsep(&loop, separators)) != NULL) {
+	while ((next = strsep(&loop, sep)) != NULL) {
+		remove = (*next != '\0' && next[strlen(next) - 1] == '@');
+		if (remove)
+			next[strlen(next) - 1] = '\0';
 		for (i = 0; i < nitems(tty_features); i++) {
 			tf = tty_features[i];
 			if (strcasecmp(tf->name, next) == 0)
@@ -382,14 +466,24 @@ tty_add_features(int *feat, const char *s, const char *separators)
 			log_debug("unknown terminal feature: %s", next);
 			break;
 		}
-		if (~(*feat) & (1 << i)) {
+		if (remove) {
+			log_debug("removing terminal feature: %s", tf->name);
+			*enabled &= ~(1 << i);
+			if (disabled != NULL)
+				*disabled |= 1 << i;
+			continue;
+		}
+		if (disabled != NULL && *disabled & (1 << i))
+			continue;
+		if (~(*enabled) & (1 << i)) {
 			log_debug("adding terminal feature: %s", tf->name);
-			(*feat) |= (1 << i);
+			(*enabled) |= (1 << i);
 		}
 	}
 	free(copy);
 }
 
+/* Get features as string. */
 const char *
 tty_get_features(int feat)
 {
@@ -411,19 +505,67 @@ tty_get_features(int feat)
 	return (s);
 }
 
+/* Check if feature is present. */
 int
-tty_apply_features(struct tty_term *term, int feat)
+tty_feature_present(struct tty_term *term, const char *name)
 {
-	const struct tty_feature	 *tf;
-	const char			**capability;
-	u_int				  i;
+	const struct tty_feature	*tf = NULL;
+	const char *const		*capability;
+	u_int				 i;
+	char				*copy;
 
+	if (strcmp(name, "utf8") == 0)
+		return ((term->tty->client->flags & CLIENT_UTF8) != 0);
+
+	for (i = 0; i < nitems(tty_features); i++) {
+		tf = tty_features[i];
+		if (strcmp(tf->name, name) == 0) {
+			if (term->applied_features & (1 << i))
+				return (1);
+			break;
+		}
+	}
+
+	/*
+	 * We don't just have the feature flag set. Check if the capabilities
+	 * supported by the client are actual set instead.
+	 */
+	if (tf == NULL || tf->capabilities == NULL ||
+	    strcmp(name, "ignorefkeys") == 0)
+		return (0);
+	if (tf->flags != 0 && (term->flags & tf->flags) != tf->flags)
+		return (0);
+	capability = tf->capabilities;
+	while (*capability != NULL) {
+		copy = xstrdup(*capability);
+		copy[strcspn(copy, "=")] = '\0';
+		if (!tty_term_has_name(term, copy)) {
+			free(copy);
+			return (0);
+		}
+		free(copy);
+		capability++;
+	}
+	return (1);
+}
+
+/* Apply featurs to terminal. */
+int
+tty_apply_features(struct tty_term *term)
+{
+	struct client			*c = term->tty->client;
+	const struct tty_feature	*tf;
+	const char *const		*capability;
+	int				 feat;
+	u_int				 i;
+
+	feat = (c->term_features & ~c->term_nofeatures);
 	if (feat == 0)
 		return (0);
 	log_debug("applying terminal features: %s", tty_get_features(feat));
 
 	for (i = 0; i < nitems(tty_features); i++) {
-		if ((term->features & (1 << i)) || (~feat & (1 << i)))
+		if ((term->applied_features & (1 << i)) || (~feat & (1 << i)))
 			continue;
 		tf = tty_features[i];
 
@@ -432,22 +574,25 @@ tty_apply_features(struct tty_term *term, int feat)
 			capability = tf->capabilities;
 			while (*capability != NULL) {
 				log_debug("adding capability: %s", *capability);
-				tty_term_apply(term, *capability, 1);
+				tty_term_apply(term, *capability, 1, tf->flags);
 				capability++;
 			}
 		}
-		term->flags |= tf->flags;
+		term->flags |= (tf->flags & ~TERM_NOREPLACE);
+		if (tf == &tty_feature_utf8)
+			c->flags |= CLIENT_UTF8;
 	}
-	if ((term->features | feat) == term->features)
+	if ((term->applied_features|feat) == term->applied_features)
 		return (0);
-	term->features |= feat;
+	term->applied_features |= feat;
 	return (1);
 }
 
+/* Add default features for a terminal identified by name and version. */
 void
-tty_default_features(int *feat, const char *name, u_int version)
+tty_default_features(struct client *c, const char *name, u_int version)
 {
-	static struct {
+	static const struct {
 		const char	*name;
 		u_int		 version;
 		const char	*features;
@@ -455,19 +600,110 @@ tty_default_features(int *feat, const char *name, u_int version)
 #define TTY_FEATURES_BASE_MODERN_XTERM \
 	"256,RGB,bpaste,clipboard,mouse,strikethrough,title"
 		{ .name = "mintty",
-		  .features = TTY_FEATURES_BASE_MODERN_XTERM
-			      ",ccolour,cstyle,extkeys,margins,overline,usstyle"
+		  .features = TTY_FEATURES_BASE_MODERN_XTERM ","
+			      "appesc,"
+			      "ccolour,"
+			      "cstyle,"
+			      "extkeys,"
+			      "margins,"
+			      "overline,"
+			      "usstyle"
 		},
 		{ .name = "tmux",
-		  .features = TTY_FEATURES_BASE_MODERN_XTERM
-			      ",ccolour,cstyle,focus,overline,usstyle,hyperlinks"
+		  .features = TTY_FEATURES_BASE_MODERN_XTERM ","
+			      "ccolour,"
+			      "cstyle,"
+			      "extkeys,"
+			      "focus,"
+			      "overline,"
+			      "usstyle,"
+			      "hyperlinks,"
+			      "progressbar"
 		},
 		{ .name = "rxvt-unicode",
-		  .features = "256,bpaste,ccolour,cstyle,mouse,title,ignorefkeys"
+		  .features = "256,"
+			      "bpaste,"
+			      "ccolour,"
+			      "cstyle,"
+			      "mouse,"
+			      "title,"
+			      "ignorefkeys"
 		},
 		{ .name = "iTerm2",
-		  .features = TTY_FEATURES_BASE_MODERN_XTERM
-			      ",cstyle,extkeys,margins,usstyle,sync,osc7,hyperlinks"
+		  .features = TTY_FEATURES_BASE_MODERN_XTERM ","
+			      "cstyle,"
+			      "extkeys,"
+			      "margins,"
+			      "usstyle,"
+			      "sync,"
+			      "osc7,"
+			      "hyperlinks,"
+			      "progressbar"
+		},
+		{ .name = "foot",
+		  .features = TTY_FEATURES_BASE_MODERN_XTERM ","
+			      "ccolour,"
+			      "cstyle,"
+			      "extkeys,"
+			      "usstyle,"
+			      "sync,"
+			      "osc7,"
+			      "hyperlinks"
+		},
+		{ .name = "WezTerm",
+		  .features = TTY_FEATURES_BASE_MODERN_XTERM ","
+			      "ccolour,"
+			      "cstyle,"
+			      "extkeys,"
+			      "focus,"
+			      "hyperlinks,"
+			      "imagescroll,"
+			      "overline,"
+			      "sixel,"
+			      "sync,"
+			      "usstyle"
+		},
+		{ .name = "ghostty",
+		  .features = TTY_FEATURES_BASE_MODERN_XTERM ","
+			      "ccolour,"
+			      "cstyle,"
+			      "extkeys,"
+			      "focus,"
+			      "imagescroll,"
+			      "margins,"
+			      "overline,"
+			      "hyperlinks,"
+			      "osc7,"
+			      "sync,"
+			      "usstyle,"
+			      "progressbar,"
+			      "kittygraphics"
+		},
+		{ .name = "kitty",
+		  .features = TTY_FEATURES_BASE_MODERN_XTERM ","
+			      "ccolour,"
+			      "cstyle,"
+			      "extkeys,"
+			      "focus,"
+			      "hyperlinks,"
+			      "imagescroll,"
+			      "osc7,"
+			      "progressbar,"
+			      "sync,"
+			      "usstyle,"
+			      "kittygraphics"
+		},
+		{ .name = "Rio",
+		  .features = TTY_FEATURES_BASE_MODERN_XTERM ","
+			      "ccolour,"
+			      "cstyle,"
+			      "focus,"
+			      "overline,"
+			      "hyperlinks,"
+			      "osc7,"
+			      "sync,"
+			      "usstyle,"
+			      "progressbar"
 		},
 		{ .name = "XTerm",
 		  /*
@@ -475,9 +711,12 @@ tty_default_features(int *feat, const char *name, u_int version)
 		   * disabled so not set it here - they will be added if
 		   * secondary DA shows VT420.
 		   */
-		  .features = TTY_FEATURES_BASE_MODERN_XTERM
-			      ",ccolour,cstyle,extkeys,focus"
-		}
+		  .features = TTY_FEATURES_BASE_MODERN_XTERM ","
+			      "ccolour,"
+			      "cstyle,"
+			      "extkeys,"
+			      "focus"
+		},
 	};
 	u_int	i;
 
@@ -486,6 +725,6 @@ tty_default_features(int *feat, const char *name, u_int version)
 			continue;
 		if (version != 0 && version < table[i].version)
 			continue;
-		tty_add_features(feat, table[i].features, ",");
+		tty_parse_client_features(c, table[i].features, ",");
 	}
 }

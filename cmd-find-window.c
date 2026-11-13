@@ -1,4 +1,4 @@
-/* $OpenBSD$ */
+/* $OpenBSD: cmd-find-window.c,v 1.58 2026/10/09 13:12:14 nicm Exp $ */
 
 /*
  * Copyright (c) 2009 Nicholas Marriott <nicholas.marriott@gmail.com>
@@ -30,6 +30,7 @@ static enum cmd_retval	cmd_find_window_exec(struct cmd *, struct cmdq_item *);
 
 const struct cmd_entry cmd_find_window_entry = {
 	.name = "find-window",
+	.description = "Find windows by content or name.",
 	.alias = "findw",
 
 	.args = { "CiNrt:TZ", 1, 1, NULL },
@@ -48,6 +49,7 @@ cmd_find_window_exec(struct cmd *self, struct cmdq_item *item)
 	struct cmd_find_state	*target = cmdq_get_target(item);
 	struct window_pane	*wp = target->wp;
 	const char		*s = args_string(args, 0), *suffix = "";
+	const char		*star = "*";
 	struct args_value	*filter;
 	int			 C, N, T;
 
@@ -55,6 +57,8 @@ cmd_find_window_exec(struct cmd *self, struct cmdq_item *item)
 	N = args_has(args, 'N');
 	T = args_has(args, 'T');
 
+	if (args_has(args, 'r'))
+		star = "";
 	if (args_has(args, 'r') && args_has(args, 'i'))
 		suffix = "/ri";
 	else if (args_has(args, 'r'))
@@ -71,42 +75,43 @@ cmd_find_window_exec(struct cmd *self, struct cmdq_item *item)
 	if (C && N && T) {
 		xasprintf(&filter->string,
 		    "#{||:"
-		    "#{C%s:%s},#{||:#{m%s:*%s*,#{window_name}},"
-		    "#{m%s:*%s*,#{pane_title}}}}",
-		    suffix, s, suffix, s, suffix, s);
+		    "#{C%s:%s},#{||:#{m%s:%s%s%s,#{window_name}},"
+		    "#{m%s:%s%s%s,#{pane_title}}}}",
+		    suffix, s, suffix, star, s, star, suffix, star, s, star);
 	} else if (C && N) {
 		xasprintf(&filter->string,
-		    "#{||:#{C%s:%s},#{m%s:*%s*,#{window_name}}}",
-		    suffix, s, suffix, s);
+		    "#{||:#{C%s:%s},#{m%s:%s%s%s,#{window_name}}}",
+		    suffix, s, suffix, star, s, star);
 	} else if (C && T) {
 		xasprintf(&filter->string,
-		    "#{||:#{C%s:%s},#{m%s:*%s*,#{pane_title}}}",
-		    suffix, s, suffix, s);
+		    "#{||:#{C%s:%s},#{m%s:%s%s%s,#{pane_title}}}",
+		    suffix, s, suffix, star, s, star);
 	} else if (N && T) {
 		xasprintf(&filter->string,
-		    "#{||:#{m%s:*%s*,#{window_name}},"
-		    "#{m%s:*%s*,#{pane_title}}}",
-		    suffix, s, suffix, s);
+		    "#{||:#{m%s:%s%s%s,#{window_name}},"
+		    "#{m%s:%s%s%s,#{pane_title}}}",
+		    suffix, star, s, star, suffix, star, s, star);
 	} else if (C) {
 		xasprintf(&filter->string,
 		    "#{C%s:%s}",
 		    suffix, s);
 	} else if (N) {
 		xasprintf(&filter->string,
-		    "#{m%s:*%s*,#{window_name}}",
-		    suffix, s);
+		    "#{m%s:%s%s%s,#{window_name}}",
+		    suffix, star, s, star);
 	} else {
 		xasprintf(&filter->string,
-		    "#{m%s:*%s*,#{pane_title}}",
-		    suffix, s);
+		    "#{m%s:%s%s%s,#{pane_title}}",
+		    suffix, star, s, star);
 	}
 
 	new_args = args_create();
 	if (args_has(args, 'Z'))
-		args_set(new_args, 'Z', NULL);
-	args_set(new_args, 'f', filter);
+		args_set(new_args, 'Z', NULL, 0);
+	args_set(new_args, 'f', filter, 0);
 
-	window_pane_set_mode(wp, NULL, &window_tree_mode, target, new_args);
+	window_pane_set_mode(wp, NULL, &window_tree_mode, item, target,
+	    new_args);
 	args_free(new_args);
 
 	return (CMD_RETURN_NORMAL);

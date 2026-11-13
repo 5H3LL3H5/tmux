@@ -79,7 +79,7 @@ A small example configuration is in `example_tmux.conf`.
 
 And a bash(1) completion file at:
 
-https://github.com/imomaliev/tmux-bash-completion
+https://github.com/scop/bash-completion/blob/main/completions-core/tmux.bash
 
 For debugging, run tmux with `-v` or `-vv` to generate server and client log
 files in the current directory.
@@ -93,3 +93,9 @@ https://groups.google.com/forum/#!forum/tmux-users
 Subscribe by sending an email to:
 
 tmux-users+subscribe@googlegroups.com
+
+## Merchandise
+
+tmux merchandise is available from
+[Commit Goods](https://commitgoods.com/collections/tmux?utm_source=github&utm_medium=referral) -
+purchases help support the tmux project.

@@ -1,4 +1,4 @@
-/* $OpenBSD$ */
+/* $OpenBSD: cmd-confirm-before.c,v 1.63 2026/10/27 13:00:14 nicm Exp $ */
 
 /*
  * Copyright (c) 2009 Tiago Cunha <me@tiagocunha.org>
@@ -33,16 +33,18 @@ static enum args_parse_type	cmd_confirm_before_args_parse(struct args *,
 static enum cmd_retval		cmd_confirm_before_exec(struct cmd *,
 				    struct cmdq_item *);
 
-static int	cmd_confirm_before_callback(struct client *, void *,
-		    const char *, int);
+static enum prompt_result cmd_confirm_before_callback(struct client *, void *,
+		    const char *, enum prompt_key_result);
 static void	cmd_confirm_before_free(void *);
 
 const struct cmd_entry cmd_confirm_before_entry = {
 	.name = "confirm-before",
+	.description = "Ask for confirmation before a command.",
 	.alias = "confirm",
 
-	.args = { "bp:t:", 1, 1, cmd_confirm_before_args_parse },
-	.usage = "[-b] [-p prompt] " CMD_TARGET_CLIENT_USAGE " command",
+	.args = { "bc:p:t:y", 1, 1, cmd_confirm_before_args_parse },
+	.usage = "[-by] [-c confirm-key] [-p prompt] " CMD_TARGET_CLIENT_USAGE
+		 " command",
 
 	.flags = CMD_CLIENT_TFLAG,
 	.exec = cmd_confirm_before_exec
@@ -51,6 +53,8 @@ const struct cmd_entry cmd_confirm_before_entry = {
 struct cmd_confirm_before_data {
 	struct cmdq_item	*item;
 	struct cmd_list		*cmdlist;
+	u_char			 confirm_key;
+	int			 default_yes;
 };
 
 static enum args_parse_type
@@ -68,22 +72,41 @@ cmd_confirm_before_exec(struct cmd *self, struct cmdq_item *item)
 	struct client			*tc = cmdq_get_target_client(item);
 	struct cmd_find_state		*target = cmdq_get_target(item);
 	char				*new_prompt;
-	const char			*prompt, *cmd;
+	const char			*confirm_key, *prompt, *cmd;
 	int				 wait = !args_has(args, 'b');
 
 	cdata = xcalloc(1, sizeof *cdata);
 	cdata->cmdlist = args_make_commands_now(self, item, 0, 1);
-	if (cdata->cmdlist == NULL)
+	if (cdata->cmdlist == NULL) {
+		free(cdata);
 		return (CMD_RETURN_ERROR);
+	}
 
 	if (wait)
 		cdata->item = item;
+
+	cdata->default_yes = args_has(args, 'y');
+	if ((confirm_key = args_get(args, 'c')) != NULL) {
+		if (confirm_key[1] == '\0' &&
+		    confirm_key[0] > 31 &&
+		    confirm_key[0] < 127)
+			cdata->confirm_key = confirm_key[0];
+		else {
+			cmdq_error(item, "invalid confirm key");
+			cmd_list_free(cdata->cmdlist);
+			free(cdata);
+			return (CMD_RETURN_ERROR);
+		}
+	}
+	else
+		cdata->confirm_key = 'y';
 
 	if ((prompt = args_get(args, 'p')) != NULL)
 		xasprintf(&new_prompt, "%s ", prompt);
 	else {
 		cmd = cmd_get_entry(cmd_list_first(cdata->cmdlist))->name;
-		xasprintf(&new_prompt, "Confirm '%s'? (y/n) ", cmd);
+		xasprintf(&new_prompt, "Confirm '%s'? (%c/n) ", cmd,
+		    cdata->confirm_key);
 	}
 
 	status_prompt_set(tc, target, new_prompt, NULL,
@@ -93,12 +116,13 @@ cmd_confirm_before_exec(struct cmd *self, struct cmdq_item *item)
 
 	if (!wait)
 		return (CMD_RETURN_NORMAL);
+	cmdq_add_flags(item, CMDQ_PROMPT);
 	return (CMD_RETURN_WAIT);
 }
 
-static int
+static enum prompt_result
 cmd_confirm_before_callback(struct client *c, void *data, const char *s,
-    __unused int done)
+    __unused enum prompt_key_result key)
 {
 	struct cmd_confirm_before_data	*cdata = data;
 	struct cmdq_item		*item = cdata->item, *new_item;
@@ -107,9 +131,9 @@ cmd_confirm_before_callback(struct client *c, void *data, const char *s,
 	if (c->flags & CLIENT_DEAD)
 		goto out;
 
-	if (s == NULL || *s == '\0')
+	if (s == NULL)
 		goto out;
-	if (tolower((u_char)s[0]) != 'y' || s[1] != '\0')
+	if (s[0] != cdata->confirm_key && (s[0] != '\r' || !cdata->default_yes))
 		goto out;
 	retcode = 0;
 
@@ -123,13 +147,13 @@ cmd_confirm_before_callback(struct client *c, void *data, const char *s,
 	}
 
 out:
-        if (item != NULL) {
-                if (cmdq_get_client(item) != NULL &&
-                    cmdq_get_client(item)->session == NULL)
-                        cmdq_get_client(item)->retval = retcode;
-                cmdq_continue(item);
-        }
-	return (0);
+	if (item != NULL) {
+		if (cmdq_get_client(item) != NULL &&
+		    cmdq_get_client(item)->session == NULL)
+			cmdq_get_client(item)->retval = retcode;
+		cmdq_continue(item);
+	}
+	return (PROMPT_CLOSE);
 }
 
 static void

@@ -3,21 +3,34 @@ name: 'Lock Threads'
 on:
   schedule:
     - cron: '0 0 * * *'
+  workflow_dispatch:
+
+permissions:
+  issues: write
+  pull-requests: write
+  discussions: write
+
+concurrency:
+  group: lock-threads
 
 jobs:
-  lock:
+  action:
     runs-on: ubuntu-latest
+    if: github.repository == 'tmux/tmux'
+    timeout-minutes: 10
     steps:
-      - uses: dessant/lock-threads@v2
+      - uses: dessant/lock-threads@89ae32b08ed1a541efecbab17912962a5e38981c # v6
         with:
           github-token: ${{ github.token }}
-          issue-lock-inactive-days: '30'
-          pr-lock-inactive-days: '60'
-          issue-lock-comment: >
+          issue-inactive-days: '30'
+          issue-comment: >
             This issue has been automatically locked since there
             has not been any recent activity after it was closed.
-            Please open a new issue for related bugs.
-          pr-lock-comment: >
+          pr-inactive-days: '60'
+          pr-comment: >
             This pull request has been automatically locked since there
             has not been any recent activity after it was closed.
-            Please open a new issue for related bugs.
+          discussion-inactive-days: '60'
+          discussion-comment: >
+            This discussion has been automatically locked since there
+            has not been any recent activity after it was closed.

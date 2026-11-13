@@ -1,4 +1,4 @@
-/* $OpenBSD$ */
+/* $OpenBSD: tty-term.c,v 1.115 2026/11/12 11:19:23 nicm Exp $ */
 
 /*
  * Copyright (c) 2008 Nicholas Marriott <nicholas.marriott@gmail.com>
@@ -31,6 +31,7 @@
 #include "tmux.h"
 
 static char	*tty_term_strip(const char *);
+static void	 tty_term_validate(struct tty_term *);
 
 struct tty_terms tty_terms = LIST_HEAD_INITIALIZER(tty_terms);
 
@@ -89,6 +90,7 @@ static const struct tty_term_code_entry tty_term_codes[] = {
 	[TTYC_DL1] = { TTYCODE_STRING, "dl1" },
 	[TTYC_DL] = { TTYCODE_STRING, "dl" },
 	[TTYC_DSEKS] = { TTYCODE_STRING, "Dseks" },
+	[TTYC_DSESC] = { TTYCODE_STRING, "Dsesc" },
 	[TTYC_DSFCS] = { TTYCODE_STRING, "Dsfcs" },
 	[TTYC_DSBP] = { TTYCODE_STRING, "Dsbp" },
 	[TTYC_DSMG] = { TTYCODE_STRING, "Dsmg" },
@@ -100,6 +102,7 @@ static const struct tty_term_code_entry tty_term_codes[] = {
 	[TTYC_ENACS] = { TTYCODE_STRING, "enacs" },
 	[TTYC_ENBP] = { TTYCODE_STRING, "Enbp" },
 	[TTYC_ENEKS] = { TTYCODE_STRING, "Eneks" },
+	[TTYC_ENESC] = { TTYCODE_STRING, "Enesc" },
 	[TTYC_ENFCS] = { TTYCODE_STRING, "Enfcs" },
 	[TTYC_ENMG] = { TTYCODE_STRING, "Enmg" },
 	[TTYC_FSL] = { TTYCODE_STRING, "fsl" },
@@ -110,8 +113,10 @@ static const struct tty_term_code_entry tty_term_codes[] = {
 	[TTYC_ICH] = { TTYCODE_STRING, "ich" },
 	[TTYC_IL1] = { TTYCODE_STRING, "il1" },
 	[TTYC_IL] = { TTYCODE_STRING, "il" },
+	[TTYC_IND] = { TTYCODE_STRING, "ind" },
 	[TTYC_INDN] = { TTYCODE_STRING, "indn" },
 	[TTYC_INVIS] = { TTYCODE_STRING, "invis" },
+	[TTYC_ISCRL] = { TTYCODE_FLAG, "Iscrl" },
 	[TTYC_KCBT] = { TTYCODE_STRING, "kcbt" },
 	[TTYC_KCUB1] = { TTYCODE_STRING, "kcub1" },
 	[TTYC_KCUD1] = { TTYCODE_STRING, "kcud1" },
@@ -250,6 +255,8 @@ static const struct tty_term_code_entry tty_term_codes[] = {
 	[TTYC_KUP6] = { TTYCODE_STRING, "kUP6" },
 	[TTYC_KUP7] = { TTYCODE_STRING, "kUP7" },
 	[TTYC_MS] = { TTYCODE_STRING, "Ms" },
+	[TTYC_NCV] = { TTYCODE_NUMBER, "ncv" },
+	[TTYC_NOBR] = { TTYCODE_STRING, "Nobr" },
 	[TTYC_OL] = { TTYCODE_STRING, "ol" },
 	[TTYC_OP] = { TTYCODE_STRING, "op" },
 	[TTYC_RECT] = { TTYCODE_STRING, "Rect" },
@@ -266,7 +273,9 @@ static const struct tty_term_code_entry tty_term_codes[] = {
 	[TTYC_SETRGBB] = { TTYCODE_STRING, "setrgbb" },
 	[TTYC_SETRGBF] = { TTYCODE_STRING, "setrgbf" },
 	[TTYC_SETULC] = { TTYCODE_STRING, "Setulc" },
+	[TTYC_SETULC1] = { TTYCODE_STRING, "Setulc1" },
 	[TTYC_SE] = { TTYCODE_STRING, "Se" },
+	[TTYC_SXL] =  { TTYCODE_FLAG, "Sxl" },
 	[TTYC_SGR0] = { TTYCODE_STRING, "sgr0" },
 	[TTYC_SITM] = { TTYCODE_STRING, "sitm" },
 	[TTYC_SMACS] = { TTYCODE_STRING, "smacs" },
@@ -277,6 +286,7 @@ static const struct tty_term_code_entry tty_term_codes[] = {
 	[TTYC_SMULX] = { TTYCODE_STRING, "Smulx" },
 	[TTYC_SMUL] = { TTYCODE_STRING, "smul" },
 	[TTYC_SMXX] =  { TTYCODE_STRING, "smxx" },
+	[TTYC_SPB] = { TTYCODE_STRING, "Spb" },
 	[TTYC_SS] = { TTYCODE_STRING, "Ss" },
 	[TTYC_SWD] = { TTYCODE_STRING, "Swd" },
 	[TTYC_SYNC] = { TTYCODE_STRING, "Sync" },
@@ -356,7 +366,8 @@ tty_term_override_next(const char *s, size_t *offset)
 }
 
 void
-tty_term_apply(struct tty_term *term, const char *capabilities, int quiet)
+tty_term_apply(struct tty_term *term, const char *capabilities, int quiet,
+    int flags)
 {
 	const struct tty_term_code_entry	*ent;
 	struct tty_code				*code;
@@ -399,8 +410,13 @@ tty_term_apply(struct tty_term *term, const char *capabilities, int quiet)
 			if (strcmp(s, ent->name) != 0)
 				continue;
 			code = &term->codes[i];
+			if ((flags & TERM_NOREPLACE) &&
+			    code->type != TTYCODE_NONE)
+				continue;
 
 			if (remove) {
+				if (code->type == TTYCODE_STRING)
+					free(code->value.string);
 				code->type = TTYCODE_NONE;
 				continue;
 			}
@@ -431,6 +447,42 @@ tty_term_apply(struct tty_term *term, const char *capabilities, int quiet)
 	}
 }
 
+static void
+tty_term_free_colours(struct tty_term *term)
+{
+	u_int	i;
+
+	for (i = 0; i < nitems(term->setaf); i++) {
+		free(term->setaf[i]);
+		term->setaf[i] = NULL;
+		free(term->setab[i]);
+		term->setab[i] = NULL;
+	}
+}
+
+static void
+tty_term_build_colours(struct tty_term *term)
+{
+	u_int		 i;
+	int		 setaf, setab;
+	const char	*s;
+
+	tty_term_free_colours(term);
+
+	setaf = tty_term_has(term, TTYC_SETAF);
+	setab = tty_term_has(term, TTYC_SETAB);
+	for (i = 0; i < nitems(term->setaf); i++) {
+		if (setaf) {
+			s = tty_term_string_i(term, TTYC_SETAF, i);
+			term->setaf[i] = xstrdup(s);
+		}
+		if (setab) {
+			s = tty_term_string_i(term, TTYC_SETAB, i);
+			term->setab[i] = xstrdup(s);
+		}
+	}
+}
+
 void
 tty_term_apply_overrides(struct tty_term *term)
 {
@@ -451,9 +503,12 @@ tty_term_apply_overrides(struct tty_term *term)
 		offset = 0;
 		first = tty_term_override_next(s, &offset);
 		if (first != NULL && fnmatch(first, term->name, 0) == 0)
-			tty_term_apply(term, s + offset, 0);
+			tty_term_apply(term, s + offset, 0, 0);
 		a = options_array_next(a);
 	}
+
+	/* Log the SIXEL flag. */
+	log_debug("SIXEL flag is %d", !!(term->flags & TERM_SIXEL));
 
 	/* Update the RGB flag if the terminal has RGB colours. */
 	if (tty_term_has(term, TTYC_SETRGBF) &&
@@ -512,12 +567,34 @@ tty_term_apply_overrides(struct tty_term *term)
 		acs = "a#j+k+l+m+n+o-p-q-r-s-t+u+v+w+x|y<z>~.";
 	for (; acs[0] != '\0' && acs[1] != '\0'; acs += 2)
 		term->acs[(u_char) acs[0]][0] = acs[1];
+
+	tty_term_build_colours(term);
+	tty_term_validate(term);
+}
+
+static void
+tty_term_validate(struct tty_term *term)
+{
+	struct tty_code	*code = &term->codes[TTYC_MS];
+
+	if (code->type != TTYCODE_STRING)
+		return;
+	if (*tty_term_string_ss(term, TTYC_MS, "c", "?") != '\0') {
+		term->flags &= ~TERM_INVALIDMS;
+		return;
+	}
+
+	log_debug("removing invalid Ms capability");
+	term->flags |= TERM_INVALIDMS;
+	free(code->value.string);
+	code->type = TTYCODE_NONE;
 }
 
 struct tty_term *
 tty_term_create(struct tty *tty, char *name, char **caps, u_int ncaps,
-    int *feat, char **cause)
+    char **cause)
 {
+	struct client				*c = tty->client;
 	struct tty_term				*term;
 	const struct tty_term_code_entry	*ent;
 	struct tty_code				*code;
@@ -525,9 +602,11 @@ tty_term_create(struct tty *tty, char *name, char **caps, u_int ncaps,
 	struct options_array_item		*a;
 	union options_value			*ov;
 	u_int					 i, j;
-	const char				*s, *value;
+	const char				*s, *value, *errstr;
 	size_t					 offset, namelen;
 	char					*first;
+	int					 n;
+	struct environ_entry			*envent;
 
 	log_debug("adding term %s", name);
 
@@ -561,8 +640,13 @@ tty_term_create(struct tty *tty, char *name, char **caps, u_int ncaps,
 				code->value.string = tty_term_strip(value);
 				break;
 			case TTYCODE_NUMBER:
-				code->type = TTYCODE_NUMBER;
-				code->value.number = atoi(value);
+				n = strtonum(value, 0, INT_MAX, &errstr);
+				if (errstr != NULL)
+					log_debug("%s: %s", ent->name, errstr);
+				else {
+					code->type = TTYCODE_NUMBER;
+					code->value.number = n;
+				}
 				break;
 			case TTYCODE_FLAG:
 				code->type = TTYCODE_FLAG;
@@ -582,7 +666,7 @@ tty_term_create(struct tty *tty, char *name, char **caps, u_int ncaps,
 		offset = 0;
 		first = tty_term_override_next(s, &offset);
 		if (first != NULL && fnmatch(first, term->name, 0) == 0)
-			tty_add_features(feat, s + offset, ":");
+			tty_parse_client_features(c, s + offset, ":");
 		a = options_array_next(a);
 	}
 
@@ -591,6 +675,16 @@ tty_term_create(struct tty *tty, char *name, char **caps, u_int ncaps,
     (NCURSES_VERSION_MAJOR == 5 && NCURSES_VERSION_MINOR > 6)
 	del_curterm(cur_term);
 #endif
+	/* Check for COLORTERM. */
+	envent = environ_find(c->environ, "COLORTERM");
+	if (envent != NULL) {
+		log_debug("%s COLORTERM=%s", c->name, envent->value);
+		if (strcasecmp(envent->value, "truecolor") == 0 ||
+		    strcasecmp(envent->value, "24bit") == 0)
+			tty_parse_client_features(c, "RGB", ",");
+ 		else if (strstr(envent->value, "256") != NULL)
+			tty_parse_client_features(c, "256", ",");
+	}
 
 	/* Apply overrides so any capabilities used for features are changed. */
 	tty_term_apply_overrides(term);
@@ -620,17 +714,17 @@ tty_term_create(struct tty *tty, char *name, char **caps, u_int ncaps,
 	s = tty_term_string(term, TTYC_CLEAR);
 	if (tty_term_flag(term, TTYC_XT) || strncmp(s, "\033[", 2) == 0) {
 		term->flags |= TERM_VT100LIKE;
-		tty_add_features(feat, "bpaste,focus,title", ",");
+		tty_parse_client_features(c, "bpaste,focus,title", ",");
 	}
 
 	/* Add RGB feature if terminal has RGB colours. */
 	if ((tty_term_flag(term, TTYC_TC) || tty_term_has(term, TTYC_RGB)) &&
 	    (!tty_term_has(term, TTYC_SETRGBF) ||
 	    !tty_term_has(term, TTYC_SETRGBB)))
-		tty_add_features(feat, "RGB", ",");
+		tty_parse_client_features(c, "RGB", ",");
 
 	/* Apply the features and overrides again. */
-	if (tty_apply_features(term, *feat))
+	if (tty_apply_features(term))
 		tty_term_apply_overrides(term);
 
 	/* Log the capabilities. */
@@ -656,6 +750,7 @@ tty_term_free(struct tty_term *term)
 			free(term->codes[i].value.string);
 	}
 	free(term->codes);
+	tty_term_free_colours(term);
 
 	LIST_REMOVE(term, entry);
 	free(term->name);
@@ -713,7 +808,7 @@ tty_term_read_list(const char *name, int fd, char ***caps, u_int *ncaps,
 			s = tmp;
 			break;
 		case TTYCODE_FLAG:
-			n = tigetflag((char *) ent->name);
+			n = tigetflag((char *)ent->name);
 			if (n == -1)
 				continue;
 			if (n)
@@ -721,6 +816,8 @@ tty_term_read_list(const char *name, int fd, char ***caps, u_int *ncaps,
 			else
 				s = "0";
 			break;
+		default:
+			fatalx("unknown capability type");
 		}
 		*caps = xreallocarray(*caps, (*ncaps) + 1, sizeof **caps);
 		xasprintf(&(*caps)[*ncaps], "%s=%s", ent->name, s);
@@ -750,6 +847,18 @@ tty_term_has(struct tty_term *term, enum tty_code_code code)
 	return (term->codes[code].type != TTYCODE_NONE);
 }
 
+int
+tty_term_has_name(struct tty_term *term, const char *name)
+{
+	u_int	i;
+
+	for (i = 0; i < tty_term_ncodes(); i++) {
+		if (strcmp(tty_term_codes[i].name, name) == 0)
+			return (tty_term_has(term, i));
+	}
+	return (0);
+}
+
 const char *
 tty_term_string(struct tty_term *term, enum tty_code_code code)
 {
@@ -761,35 +870,108 @@ tty_term_string(struct tty_term *term, enum tty_code_code code)
 }
 
 const char *
-tty_term_string1(struct tty_term *term, enum tty_code_code code, int a)
+tty_term_string_i(struct tty_term *term, enum tty_code_code code, int a)
 {
-	return (tparm((char *) tty_term_string(term, code), a, 0, 0, 0, 0, 0, 0, 0, 0));
+	const char	*x, *s;
+
+	if (a >= 0 && (u_int)a < nitems(term->setaf)) {
+		if (code == TTYC_SETAF && term->setaf[a] != NULL)
+			return (term->setaf[a]);
+		if (code == TTYC_SETAB && term->setab[a] != NULL)
+			return (term->setab[a]);
+	}
+	x = tty_term_string(term, code);
+
+#if defined(HAVE_TIPARM_S)
+	s = tiparm_s(1, 0, x, a);
+#elif defined(HAVE_TIPARM)
+	s = tiparm(x, a);
+#else
+	s = tparm((char *)x, a, 0, 0, 0, 0, 0, 0, 0, 0);
+#endif
+	if (s == NULL) {
+		log_debug("could not expand %s", tty_term_codes[code].name);
+		return ("");
+	}
+	return (s);
 }
 
 const char *
-tty_term_string2(struct tty_term *term, enum tty_code_code code, int a, int b)
+tty_term_string_ii(struct tty_term *term, enum tty_code_code code, int a, int b)
 {
-	return (tparm((char *) tty_term_string(term, code), a, b, 0, 0, 0, 0, 0, 0, 0));
+	const char	*x = tty_term_string(term, code), *s;
+
+#if defined(HAVE_TIPARM_S)
+	s = tiparm_s(2, 0, x, a, b);
+#elif defined(HAVE_TIPARM)
+	s = tiparm(x, a, b);
+#else
+	s = tparm((char *)x, a, b, 0, 0, 0, 0, 0, 0, 0);
+#endif
+	if (s == NULL) {
+		log_debug("could not expand %s", tty_term_codes[code].name);
+		return ("");
+	}
+	return (s);
 }
 
 const char *
-tty_term_string3(struct tty_term *term, enum tty_code_code code, int a, int b,
-    int c)
+tty_term_string_iii(struct tty_term *term, enum tty_code_code code, int a,
+    int b, int c)
 {
-	return (tparm((char *) tty_term_string(term, code), a, b, c, 0, 0, 0, 0, 0, 0));
+	const char	*x = tty_term_string(term, code), *s;
+
+#if defined(HAVE_TIPARM_S)
+	s = tiparm_s(3, 0, x, a, b, c);
+#elif defined(HAVE_TIPARM)
+	s = tiparm(x, a, b, c);
+#else
+	s = tparm((char *)x, a, b, c, 0, 0, 0, 0, 0, 0);
+#endif
+	if (s == NULL) {
+		log_debug("could not expand %s", tty_term_codes[code].name);
+		return ("");
+	}
+	return (s);
 }
 
 const char *
-tty_term_ptr1(struct tty_term *term, enum tty_code_code code, const void *a)
+tty_term_string_s(struct tty_term *term, enum tty_code_code code, const char *a)
 {
-	return (tparm((char *) tty_term_string(term, code), (long)a, 0, 0, 0, 0, 0, 0, 0, 0));
+	const char	*x = tty_term_string(term, code), *s;
+
+#if defined(HAVE_TIPARM_S)
+	s = tiparm_s(1, 1, x, a);
+#elif defined(HAVE_TIPARM)
+	s = tiparm(x, a);
+#else
+	s = tparm((char *)x, (long)a, 0, 0, 0, 0, 0, 0, 0, 0);
+#endif
+	if (s == NULL) {
+		log_debug("could not expand %s", tty_term_codes[code].name);
+		return ("");
+	}
+	return (s);
 }
 
 const char *
-tty_term_ptr2(struct tty_term *term, enum tty_code_code code, const void *a,
-    const void *b)
+tty_term_string_ss(struct tty_term *term, enum tty_code_code code,
+    const char *a, const char *b)
 {
-	return (tparm((char *) tty_term_string(term, code), (long)a, (long)b, 0, 0, 0, 0, 0, 0, 0));
+	const char	*x = tty_term_string(term, code), *s;
+
+#if defined(HAVE_TIPARM_S)
+	s = tiparm_s(2, 3, x, a, b);
+#elif defined(HAVE_TIPARM)
+	s = tiparm(x, a, b);
+#else
+	s = tparm((char *)x, (long)a, (long)b, 0, 0, 0, 0, 0, 0, 0);
+#endif
+	if (s == NULL) {
+		log_debug("could not expand %s", tty_term_codes[code].name);
+		return ("");
+	}
+	return (s);
 }
 
 int

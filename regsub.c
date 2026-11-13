@@ -1,4 +1,4 @@
-/* $OpenBSD$ */
+/* $OpenBSD: regsub.c,v 1.11 2026/10/20 07:10:22 nicm Exp $ */
 
 /*
  * Copyright (c) 2019 Nicholas Marriott <nicholas.marriott@gmail.com>
@@ -24,7 +24,8 @@
 #include "tmux.h"
 
 static void
-regsub_copy(char **buf, size_t *len, const char *text, size_t start, size_t end)
+regsub_copy(char **buf, ssize_t *len, const char *text, size_t start,
+    size_t end)
 {
 	size_t	add = end - start;
 
@@ -34,14 +35,14 @@ regsub_copy(char **buf, size_t *len, const char *text, size_t start, size_t end)
 }
 
 static void
-regsub_expand(char **buf, size_t *len, const char *with, const char *text,
+regsub_expand(char **buf, ssize_t *len, const char *with, const char *text,
     regmatch_t *m, u_int n)
 {
 	const char	*cp;
 	u_int		 i;
 
 	for (cp = with; *cp != '\0'; cp++) {
-		if (*cp == '\\') {
+		if (cp[0] == '\\' && cp[1] != '\0') {
 			cp++;
 			if (*cp >= '0' && *cp <= '9') {
 				i = *cp - '0';
@@ -63,21 +64,26 @@ regsub(const char *pattern, const char *with, const char *text, int flags)
 	regex_t		 r;
 	regmatch_t	 m[10];
 	ssize_t		 start, end, last, len = 0;
-	int		 empty = 0;
+	int		 empty, eflags;
 	char		*buf = NULL;
 
 	if (*text == '\0')
 		return (xstrdup(""));
+	if (*pattern == '\0')
+		return (xstrdup(text));
 	if (regcomp(&r, pattern, flags) != 0)
 		return (NULL);
 
 	start = 0;
 	last = 0;
 	end = strlen(text);
+	empty = (*pattern == '^');
 
 	while (start <= end) {
-		if (regexec(&r, text + start, nitems(m), m, 0) != 0) {
-			regsub_copy(&buf, &len, text, start, end);
+		/* Only the start of the text may match ^. */
+		eflags = (start == 0) ? 0 : REG_NOTBOL;
+		if (regexec(&r, text + start, nitems(m), m, eflags) != 0) {
+			regsub_copy(&buf, &len, text, last, end);
 			break;
 		}
 
@@ -105,12 +111,6 @@ regsub(const char *pattern, const char *with, const char *text, int flags)
 			last = start + m[0].rm_eo;
 			start += m[0].rm_eo + 1;
 			empty = 1;
-		}
-
-		/* Stop now if anchored to start. */
-		if (*pattern == '^') {
-			regsub_copy(&buf, &len, text, start, end);
-			break;
 		}
 	}
 	buf[len] = '\0';

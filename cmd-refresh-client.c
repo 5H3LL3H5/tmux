@@ -1,4 +1,4 @@
-/* $OpenBSD$ */
+/* $OpenBSD: cmd-refresh-client.c,v 1.58 2026/11/12 11:26:25 nicm Exp $ */
 
 /*
  * Copyright (c) 2007 Nicholas Marriott <nicholas.marriott@gmail.com>
@@ -32,11 +32,13 @@ static enum cmd_retval	cmd_refresh_client_exec(struct cmd *,
 
 const struct cmd_entry cmd_refresh_client_entry = {
 	.name = "refresh-client",
+	.description = "Refresh or resize a client.",
 	.alias = "refresh",
 
-	.args = { "A:B:cC:Df:F:l::LRSt:U", 0, 1, NULL },
-	.usage = "[-cDlLRSU] [-A pane:state] [-B name:what:format] "
-		 "[-C XxY] [-f flags] " CMD_TARGET_CLIENT_USAGE " [adjustment]",
+	.args = { "A:B:cC:Df:r:F:lLqRSt:U", 0, 1, NULL },
+	.usage = "[-cDlLqRSU] [-A pane:state] [-B name:what:format] "
+		 "[-C XxY] [-f flags] [-r pane:report] " CMD_TARGET_CLIENT_USAGE
+		 " [adjustment]",
 
 	.flags = CMD_AFTERHOOK|CMD_CLIENT_TFLAG,
 	.exec = cmd_refresh_client_exec
@@ -45,36 +47,17 @@ const struct cmd_entry cmd_refresh_client_entry = {
 static void
 cmd_refresh_client_update_subscription(struct client *tc, const char *value)
 {
-	char			*copy, *split, *name, *what;
-	enum control_sub_type	 subtype;
-	int			 subid = -1;
+	char			*name, *format;
+	enum monitor_type	 type;
+	int			 id;
 
-	copy = name = xstrdup(value);
-	if ((split = strchr(copy, ':')) == NULL) {
-		control_remove_sub(tc, copy);
-		goto out;
+	if (monitor_parse(value, &name, &type, &id, &format) != 0) {
+		control_remove_sub(tc, value);
+		return;
 	}
-	*split++ = '\0';
-
-	what = split;
-	if ((split = strchr(what, ':')) == NULL)
-		goto out;
-	*split++ = '\0';
-
-	if (strcmp(what, "%*") == 0)
-		subtype = CONTROL_SUB_ALL_PANES;
-	else if (sscanf(what, "%%%d", &subid) == 1 && subid >= 0)
-		subtype = CONTROL_SUB_PANE;
-	else if (strcmp(what, "@*") == 0)
-		subtype = CONTROL_SUB_ALL_WINDOWS;
-	else if (sscanf(what, "@%d", &subid) == 1 && subid >= 0)
-		subtype = CONTROL_SUB_WINDOW;
-	else
-		subtype = CONTROL_SUB_SESSION;
-	control_add_sub(tc, name, subtype, subid, split);
-
-out:
-	free(copy);
+	control_add_sub(tc, name, type, id, format);
+	free(name);
+	free(format);
 }
 
 static enum cmd_retval
@@ -84,7 +67,6 @@ cmd_refresh_client_control_client_size(struct cmd *self, struct cmdq_item *item)
 	struct client		*tc = cmdq_get_target_client(item);
 	const char		*size = args_get(args, 'C');
 	u_int			 w, x, y;
-	struct client_window	*cw;
 
 	if (sscanf(size, "@%u:%ux%u", &w, &x, &y) == 3) {
 		if (x < WINDOW_MINIMUM || x > WINDOW_MAXIMUM ||
@@ -94,22 +76,16 @@ cmd_refresh_client_control_client_size(struct cmd *self, struct cmdq_item *item)
 		}
 		log_debug("%s: client %s window @%u: size %ux%u", __func__,
 		    tc->name, w, x, y);
-		cw = server_client_add_client_window(tc, w);
-		cw->sx = x;
-		cw->sy = y;
+		control_set_window_size(tc, w, x, y);
 		tc->flags |= CLIENT_WINDOWSIZECHANGED;
 		recalculate_sizes_now(1);
 		return (CMD_RETURN_NORMAL);
 	}
 	if (sscanf(size, "@%u:", &w) == 1) {
-		cw = server_client_get_client_window(tc, w);
-		if (cw != NULL) {
-			log_debug("%s: client %s window @%u: no size", __func__,
-			    tc->name, w);
-			cw->sx = 0;
-			cw->sy = 0;
-			recalculate_sizes_now(1);
-		}
+		log_debug("%s: client %s window @%u: no size", __func__,
+		    tc->name, w);
+		control_clear_window_size(tc, w);
+		recalculate_sizes_now(1);
 		return (CMD_RETURN_NORMAL);
 	}
 
@@ -134,7 +110,6 @@ cmd_refresh_client_update_offset(struct client *tc, const char *value)
 {
 	struct window_pane	*wp;
 	char			*copy, *split;
-	u_int			 pane;
 
 	if (*value != '%')
 		return;
@@ -143,9 +118,7 @@ cmd_refresh_client_update_offset(struct client *tc, const char *value)
 		goto out;
 	*split++ = '\0';
 
-	if (sscanf(copy, "%%%u", &pane) != 1)
-		goto out;
-	wp = window_pane_find_by_id(pane);
+	wp = window_pane_find_by_id_str(copy);
 	if (wp == NULL)
 		goto out;
 
@@ -162,35 +135,36 @@ out:
 	free(copy);
 }
 
-static enum cmd_retval
-cmd_refresh_client_clipboard(struct cmd *self, struct cmdq_item *item)
+static void
+cmd_refresh_report(struct tty *tty, const char *value)
 {
-	struct args		*args = cmd_get_args(self);
-	struct client		*tc = cmdq_get_target_client(item);
-	const char		*p;
-	u_int			 i;
-	struct cmd_find_state	 fs;
+	struct window_pane	*wp;
+	int			 fg, bg;
+	size_t			 size = 0;
+	char			*copy, *split;
 
-	p = args_get(args, 'l');
-	if (p == NULL) {
-		if (tc->flags & CLIENT_CLIPBOARDBUFFER)
-			return (CMD_RETURN_NORMAL);
-		tc->flags |= CLIENT_CLIPBOARDBUFFER;
-	} else {
-		if (cmd_find_target(&fs, item, p, CMD_FIND_PANE, 0) != 0)
-			return (CMD_RETURN_ERROR);
-		for (i = 0; i < tc->clipboard_npanes; i++) {
-			if (tc->clipboard_panes[i] == fs.wp->id)
-				break;
-		}
-		if (i != tc->clipboard_npanes)
-			return (CMD_RETURN_NORMAL);
-		tc->clipboard_panes = xreallocarray(tc->clipboard_panes,
-		    tc->clipboard_npanes + 1, sizeof *tc->clipboard_panes);
-		tc->clipboard_panes[tc->clipboard_npanes++] = fs.wp->id;
+	if (*value != '%')
+		return;
+	copy = xstrdup(value);
+	if ((split = strchr(copy, ':')) == NULL)
+		goto out;
+	*split++ = '\0';
+
+	wp = window_pane_find_by_id_str(copy);
+	if (wp == NULL)
+		goto out;
+
+	fg = wp->control_fg;
+	bg = wp->control_bg;
+	if (tty_keys_colours(tty, split, strlen(split), &size, &fg, &bg) == 0) {
+		if (bg != wp->control_bg)
+			wp->flags |= PANE_THEMECHANGED;
+		wp->control_fg = fg;
+	        wp->control_bg = bg;
 	}
-	tty_clipboard_query(&tc->tty);
-	return (CMD_RETURN_NORMAL);
+
+out:
+	free(copy);
 }
 
 static enum cmd_retval
@@ -255,13 +229,22 @@ cmd_refresh_client_exec(struct cmd *self, struct cmdq_item *item)
 		return (CMD_RETURN_NORMAL);
 	}
 
-	if (args_has(args, 'l'))
-		return (cmd_refresh_client_clipboard(self, item));
+	if (args_has(args, 'l')) {
+		tty_clipboard_query(&tc->tty);
+		return (CMD_RETURN_NORMAL);
+	}
+
+	if (args_has(args, 'q')) {
+		tty_size_query(&tc->tty);
+		return (CMD_RETURN_NORMAL);
+	}
 
 	if (args_has(args, 'F')) /* -F is an alias for -f */
 		server_client_set_flags(tc, args_get(args, 'F'));
 	if (args_has(args, 'f'))
 		server_client_set_flags(tc, args_get(args, 'f'));
+	if (args_has(args, 'r'))
+		cmd_refresh_report(tty, args_get(args, 'r'));
 
 	if (args_has(args, 'A')) {
 		if (~tc->flags & CLIENT_CONTROL)

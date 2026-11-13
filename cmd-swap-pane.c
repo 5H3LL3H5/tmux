@@ -1,4 +1,4 @@
-/* $OpenBSD$ */
+/* $OpenBSD: cmd-swap-pane.c,v 1.57 2026/10/09 13:12:14 nicm Exp $ */
 
 /*
  * Copyright (c) 2009 Nicholas Marriott <nicholas.marriott@gmail.com>
@@ -30,6 +30,7 @@ static enum cmd_retval	cmd_swap_pane_exec(struct cmd *, struct cmdq_item *);
 
 const struct cmd_entry cmd_swap_pane_entry = {
 	.name = "swap-pane",
+	.description = "Swap two panes.",
 	.alias = "swapp",
 
 	.args = { "dDs:t:UZ", 0, 0, NULL },
@@ -42,6 +43,22 @@ const struct cmd_entry cmd_swap_pane_entry = {
 	.exec = cmd_swap_pane_exec
 };
 
+static struct window_pane *
+cmd_swap_pane_next_tiled_pane(struct window_pane *wp)
+{
+	while (wp != NULL && !layout_cell_is_tiled(wp->layout_cell))
+		wp = TAILQ_NEXT(wp, entry);
+	return (wp);
+}
+
+static struct window_pane *
+cmd_swap_pane_prev_tiled_pane(struct window_pane *wp)
+{
+	while (wp != NULL && !layout_cell_is_tiled(wp->layout_cell))
+		wp = TAILQ_PREV(wp, window_panes, entry);
+	return (wp);
+}
+
 static enum cmd_retval
 cmd_swap_pane_exec(struct cmd *self, struct cmdq_item *item)
 {
@@ -52,25 +69,47 @@ cmd_swap_pane_exec(struct cmd *self, struct cmdq_item *item)
 	struct window_pane	*tmp_wp, *src_wp, *dst_wp;
 	struct layout_cell	*src_lc, *dst_lc;
 	u_int			 sx, sy, xoff, yoff;
+	int			 src_idx, dst_idx;
 
 	dst_w = target->wl->window;
 	dst_wp = target->wp;
+	dst_idx = target->wl->idx;
 	src_w = source->wl->window;
 	src_wp = source->wp;
+	src_idx = source->wl->idx;
+
+	if (src_wp == src_w->modal || dst_wp == dst_w->modal) {
+		cmdq_error(item, "pane is modal");
+		return (CMD_RETURN_ERROR);
+	}
 
 	if (window_push_zoom(dst_w, 0, args_has(args, 'Z')))
 		server_redraw_window(dst_w);
 
 	if (args_has(args, 'D')) {
+		if (window_pane_is_floating(dst_wp)) {
+			cmdq_error(item, "cannot swap down on floating pane");
+			goto error;
+		}
 		src_w = dst_w;
 		src_wp = TAILQ_NEXT(dst_wp, entry);
-		if (src_wp == NULL)
+		src_wp = cmd_swap_pane_next_tiled_pane(src_wp);
+		if (src_wp == NULL) {
 			src_wp = TAILQ_FIRST(&dst_w->panes);
+			src_wp = cmd_swap_pane_next_tiled_pane(src_wp);
+		}
 	} else if (args_has(args, 'U')) {
+		if (window_pane_is_floating(dst_wp)) {
+			cmdq_error(item, "cannot swap up on floating pane");
+			goto error;
+		}
 		src_w = dst_w;
 		src_wp = TAILQ_PREV(dst_wp, window_panes, entry);
-		if (src_wp == NULL)
+		src_wp = cmd_swap_pane_prev_tiled_pane(src_wp);
+		if (src_wp == NULL) {
 			src_wp = TAILQ_LAST(&dst_w->panes, window_panes);
+			src_wp = cmd_swap_pane_prev_tiled_pane(src_wp);
+		}
 	}
 
 	if (src_w != dst_w && window_push_zoom(src_w, 0, args_has(args, 'Z')))
@@ -92,6 +131,16 @@ cmd_swap_pane_exec(struct cmd *self, struct cmdq_item *item)
 	else
 		TAILQ_INSERT_AFTER(&dst_w->panes, tmp_wp, src_wp, entry);
 
+	tmp_wp = TAILQ_PREV(dst_wp, window_panes, zentry);
+	TAILQ_REMOVE(&dst_w->z_index, dst_wp, zentry);
+	TAILQ_REPLACE(&src_w->z_index, src_wp, dst_wp, zentry);
+	if (tmp_wp == src_wp)
+		tmp_wp = dst_wp;
+	if (tmp_wp == NULL)
+		TAILQ_INSERT_HEAD(&dst_w->z_index, src_wp, zentry);
+	else
+		TAILQ_INSERT_AFTER(&dst_w->z_index, tmp_wp, src_wp, zentry);
+
 	src_lc = src_wp->layout_cell;
 	dst_lc = dst_wp->layout_cell;
 	src_lc->wp = dst_wp;
@@ -101,10 +150,10 @@ cmd_swap_pane_exec(struct cmd *self, struct cmdq_item *item)
 
 	src_wp->window = dst_w;
 	options_set_parent(src_wp->options, dst_w->options);
-	src_wp->flags |= PANE_STYLECHANGED;
+	src_wp->flags |= (PANE_STYLECHANGED|PANE_THEMECHANGED);
 	dst_wp->window = src_w;
 	options_set_parent(dst_wp->options, src_w->options);
-	dst_wp->flags |= PANE_STYLECHANGED;
+	dst_wp->flags |= (PANE_STYLECHANGED|PANE_THEMECHANGED);
 
 	sx = src_wp->sx; sy = src_wp->sy;
 	xoff = src_wp->xoff; yoff = src_wp->yoff;
@@ -128,16 +177,25 @@ cmd_swap_pane_exec(struct cmd *self, struct cmdq_item *item)
 			window_set_active_pane(dst_w, src_wp, 1);
 	}
 	if (src_w != dst_w) {
-		if (src_w->last == src_wp)
-			src_w->last = NULL;
-		if (dst_w->last == dst_wp)
-			dst_w->last = NULL;
+		window_pane_stack_remove(&src_w->last_panes, src_wp);
+		window_pane_stack_remove(&dst_w->last_panes, dst_wp);
+		colour_palette_from_option(&src_wp->palette, src_wp->options);
+		colour_palette_from_option(&dst_wp->palette, dst_wp->options);
+		layout_fix_panes(src_w, NULL);
+		redraw_invalidate_scene(src_w);
+		server_redraw_window(src_w);
 	}
-	server_redraw_window(src_w);
+	layout_fix_panes(dst_w, NULL);
+	redraw_invalidate_scene(dst_w);
 	server_redraw_window(dst_w);
-	notify_window("window-layout-changed", src_w);
+
+	if (src_w != dst_w) {
+		window_fire_pane_moved(src_wp, src_w, src_idx, dst_w, dst_idx);
+		window_fire_pane_moved(dst_wp, dst_w, dst_idx, src_w, src_idx);
+	}
+	events_fire_window("window-layout-changed", src_w);
 	if (src_w != dst_w)
-		notify_window("window-layout-changed", dst_w);
+		events_fire_window("window-layout-changed", dst_w);
 
 out:
 	if (window_pop_zoom(src_w))
@@ -145,4 +203,9 @@ out:
 	if (src_w != dst_w && window_pop_zoom(dst_w))
 		server_redraw_window(dst_w);
 	return (CMD_RETURN_NORMAL);
+
+error:
+	if (window_pop_zoom(dst_w))
+		server_redraw_window(dst_w);
+	return (CMD_RETURN_ERROR);
 }

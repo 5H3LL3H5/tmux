@@ -1,4 +1,4 @@
-/* $OpenBSD$ */
+/* $OpenBSD: style.c,v 1.49 2026/11/13 09:58:45 nicm Exp $ */
 
 /*
  * Copyright (c) 2007 Nicholas Marriott <nicholas.marriott@gmail.com>
@@ -32,15 +32,33 @@
 static struct style style_default = {
 	{ { { ' ' }, 0, 1, 1 }, 0, 0, 8, 8, 0, 0 },
 	0,
+	0,
 
 	8,
 	STYLE_ALIGN_DEFAULT,
 	STYLE_LIST_OFF,
 
-	STYLE_RANGE_NONE, 0,
+	STYLE_RANGE_NONE, 0, "",
+
+	STYLE_WIDTH_DEFAULT, 0, STYLE_PAD_DEFAULT,
+	0,
+	0,
 
 	STYLE_DEFAULT_BASE
 };
+
+/*
+ * Global hyperlink set holding the URIs for #[link=...] styles, so a style
+ * only needs to store a small ID rather than the URI itself.
+ */
+static struct hyperlinks	*style_hyperlinks;
+
+/* Set range string. */
+static void
+style_set_range_string(struct style *sy, const char *s)
+{
+	strlcpy(sy->range_string, s, sizeof sy->range_string);
+}
 
 /*
  * Parse an embedded style of the form "fg=colour,bg=colour,bright,...".  Note
@@ -51,10 +69,11 @@ int
 style_parse(struct style *sy, const struct grid_cell *base, const char *in)
 {
 	struct style	saved;
-	const char	delimiters[] = " ,\n", *cp;
-	char		tmp[256], *found;
+	const char	delimiters[] = " ,\n", *errstr;
+	char		tmp[MAX_HYPERLINK_URI + 32], *found;
 	int		value;
 	size_t		end;
+	u_int		n;
 
 	if (*in == '\0')
 		return (0);
@@ -77,8 +96,10 @@ style_parse(struct style *sy, const struct grid_cell *base, const char *in)
 		if (strcasecmp(tmp, "default") == 0) {
 			sy->gc.fg = base->fg;
 			sy->gc.bg = base->bg;
+			sy->gc.us = base->us;
 			sy->gc.attr = base->attr;
 			sy->gc.flags = base->flags;
+			sy->link = 0;
 		} else if (strcasecmp(tmp, "ignore") == 0)
 			sy->ignore = 1;
 		else if (strcasecmp(tmp, "noignore") == 0)
@@ -87,6 +108,10 @@ style_parse(struct style *sy, const struct grid_cell *base, const char *in)
 			sy->default_type = STYLE_DEFAULT_PUSH;
 		else if (strcasecmp(tmp, "pop-default") == 0)
 			sy->default_type = STYLE_DEFAULT_POP;
+		else if (strcasecmp(tmp, "set-default") == 0)
+			sy->default_type = STYLE_DEFAULT_SET;
+		else if (strcasecmp(tmp, "nl") == 0)
+			sy->nl = 1;
 		else if (strcasecmp(tmp, "nolist") == 0)
 			sy->list = STYLE_LIST_OFF;
 		else if (strncasecmp(tmp, "list=", 5) == 0) {
@@ -103,32 +128,73 @@ style_parse(struct style *sy, const struct grid_cell *base, const char *in)
 		} else if (strcasecmp(tmp, "norange") == 0) {
 			sy->range_type = style_default.range_type;
 			sy->range_argument = style_default.range_type;
+			strlcpy(sy->range_string, style_default.range_string,
+			    sizeof sy->range_string);
 		} else if (end > 6 && strncasecmp(tmp, "range=", 6) == 0) {
 			found = strchr(tmp + 6, '|');
 			if (found != NULL) {
 				*found++ = '\0';
 				if (*found == '\0')
 					goto error;
-				for (cp = found; *cp != '\0'; cp++) {
-					if (!isdigit((u_char)*cp))
-						goto error;
-				}
 			}
 			if (strcasecmp(tmp + 6, "left") == 0) {
 				if (found != NULL)
 					goto error;
 				sy->range_type = STYLE_RANGE_LEFT;
 				sy->range_argument = 0;
+				style_set_range_string(sy, "");
 			} else if (strcasecmp(tmp + 6, "right") == 0) {
 				if (found != NULL)
 					goto error;
 				sy->range_type = STYLE_RANGE_RIGHT;
 				sy->range_argument = 0;
+				style_set_range_string(sy, "");
+			} else if (strcasecmp(tmp + 6, "control") == 0) {
+				if (found == NULL)
+					goto error;
+				n = strtonum(found, 0, 9, &errstr);
+				if (errstr != NULL)
+					goto error;
+				sy->range_type = STYLE_RANGE_CONTROL;
+				sy->range_argument = n;
+				style_set_range_string(sy, "");
+			} else if (strcasecmp(tmp + 6, "pane") == 0) {
+				if (found == NULL)
+					goto error;
+				if (*found != '%' || found[1] == '\0')
+					goto error;
+				n = strtonum(found + 1, 0, UINT_MAX, &errstr);
+				if (errstr != NULL)
+					goto error;
+				sy->range_type = STYLE_RANGE_PANE;
+				sy->range_argument = n;
+				style_set_range_string(sy, "");
 			} else if (strcasecmp(tmp + 6, "window") == 0) {
 				if (found == NULL)
 					goto error;
+				n = strtonum(found, 0, UINT_MAX, &errstr);
+				if (errstr != NULL)
+					goto error;
 				sy->range_type = STYLE_RANGE_WINDOW;
-				sy->range_argument = atoi(found);
+				sy->range_argument = n;
+				style_set_range_string(sy, "");
+			} else if (strcasecmp(tmp + 6, "session") == 0) {
+				if (found == NULL)
+					goto error;
+				if (*found != '$' || found[1] == '\0')
+					goto error;
+				n = strtonum(found + 1, 0, UINT_MAX, &errstr);
+				if (errstr != NULL)
+					goto error;
+				sy->range_type = STYLE_RANGE_SESSION;
+				sy->range_argument = n;
+				style_set_range_string(sy, "");
+			} else if (strcasecmp(tmp + 6, "user") == 0) {
+				if (found == NULL)
+					goto error;
+				sy->range_type = STYLE_RANGE_USER;
+				sy->range_argument = 0;
+				style_set_range_string(sy, found);
 			}
 		} else if (strcasecmp(tmp, "noalign") == 0)
 			sy->align = style_default.align;
@@ -147,6 +213,13 @@ style_parse(struct style *sy, const struct grid_cell *base, const char *in)
 			if ((value = colour_fromstring(tmp + 5)) == -1)
 				goto error;
 			sy->fill = value;
+		} else if (end > 4 && strncasecmp(tmp, "dim=", 4) == 0) {
+			if (tmp[end - 1] == '%')
+				tmp[end - 1] = '\0';
+			n = strtonum(tmp + 4, 0, 100, &errstr);
+			if (errstr != NULL)
+				goto error;
+			sy->dim = n;
 		} else if (end > 3 && strncasecmp(tmp + 1, "g=", 2) == 0) {
 			if ((value = colour_fromstring(tmp + 3)) == -1)
 				goto error;
@@ -162,12 +235,55 @@ style_parse(struct style *sy, const struct grid_cell *base, const char *in)
 					sy->gc.bg = base->bg;
 			} else
 				goto error;
+		} else if (end > 3 && strncasecmp(tmp, "us=", 3) == 0) {
+			if ((value = colour_fromstring(tmp + 3)) == -1)
+				goto error;
+			if (value != 8)
+				sy->gc.us = value;
+			else
+				sy->gc.us = base->us;
 		} else if (strcasecmp(tmp, "none") == 0)
 			sy->gc.attr = 0;
 		else if (end > 2 && strncasecmp(tmp, "no", 2) == 0) {
-			if ((value = attributes_fromstring(tmp + 2)) == -1)
+			if (strcmp(tmp + 2, "link") == 0)
+				sy->link = 0;
+			else if (strcmp(tmp + 2, "attr") == 0)
+				sy->gc.attr |= GRID_ATTR_NOATTR;
+			else {
+				value = attributes_fromstring(tmp + 2);
+				if (value == -1)
+					goto error;
+				sy->gc.attr &= ~value;
+			}
+		} else if (end > 6 && strncasecmp(tmp, "width=", 6) == 0) {
+			if (end > 7 && tmp[end - 1] == '%') {
+				tmp[end - 1] = '\0';
+				n = strtonum(tmp + 6, 0, 100, &errstr);
+				if (errstr != NULL)
+					goto error;
+				sy->width = (int)n;
+				sy->width_percentage = 1;
+			} else {
+				n = strtonum(tmp + 6, 0, UINT_MAX, &errstr);
+				if (errstr != NULL)
+					goto error;
+				sy->width = (int)n;
+				sy->width_percentage = 0;
+			}
+		} else if (end > 4 && strncasecmp(tmp, "pad=", 4) == 0) {
+			n = strtonum(tmp + 4, 0, UINT_MAX, &errstr);
+			if (errstr != NULL)
 				goto error;
-			sy->gc.attr &= ~value;
+			sy->pad = (int)n;
+		} else if (strncasecmp(tmp, "link=", 5) == 0) {
+			if (tmp[5] == '\0')
+				sy->link = 0;
+			else {
+				if (style_hyperlinks == NULL)
+					style_hyperlinks = hyperlinks_init();
+				sy->link = hyperlinks_put(style_hyperlinks,
+				    tmp + 5, tmp + 5);
+			}
 		} else {
 			if ((value = attributes_fromstring(tmp)) == -1)
 				goto error;
@@ -190,9 +306,9 @@ style_tostring(struct style *sy)
 {
 	struct grid_cell	*gc = &sy->gc;
 	int			 off = 0;
-	const char		*comma = "", *tmp = "";
-	static char		 s[256];
-	char			 b[16];
+	const char		*comma = "", *tmp = "", *uri;
+	static char		 s[MAX_HYPERLINK_URI + 2048];
+	char			 b[21];
 
 	*s = '\0';
 
@@ -214,8 +330,18 @@ style_tostring(struct style *sy)
 			tmp = "left";
 		else if (sy->range_type == STYLE_RANGE_RIGHT)
 			tmp = "right";
-		else if (sy->range_type == STYLE_RANGE_WINDOW) {
+		else if (sy->range_type == STYLE_RANGE_PANE) {
+			snprintf(b, sizeof b, "pane|%%%u", sy->range_argument);
+			tmp = b;
+		} else if (sy->range_type == STYLE_RANGE_WINDOW) {
 			snprintf(b, sizeof b, "window|%u", sy->range_argument);
+			tmp = b;
+		} else if (sy->range_type == STYLE_RANGE_SESSION) {
+			snprintf(b, sizeof b, "session|$%u",
+			    sy->range_argument);
+			tmp = b;
+		} else if (sy->range_type == STYLE_RANGE_USER) {
+			snprintf(b, sizeof b, "user|%s", sy->range_string);
 			tmp = b;
 		}
 		off += xsnprintf(s + off, sizeof s - off, "%srange=%s", comma,
@@ -240,12 +366,19 @@ style_tostring(struct style *sy)
 			tmp = "push-default";
 		else if (sy->default_type == STYLE_DEFAULT_POP)
 			tmp = "pop-default";
+		else if (sy->default_type == STYLE_DEFAULT_SET)
+			tmp = "set-default";
 		off += xsnprintf(s + off, sizeof s - off, "%s%s", comma, tmp);
 		comma = ",";
 	}
 	if (sy->fill != 8) {
 		off += xsnprintf(s + off, sizeof s - off, "%sfill=%s", comma,
 		    colour_tostring(sy->fill));
+		comma = ",";
+	}
+	if (sy->dim != 0) {
+		off += xsnprintf(s + off, sizeof s - off, "%sdim=%d%%", comma,
+		    sy->dim);
 		comma = ",";
 	}
 	if (gc->fg != 8) {
@@ -258,19 +391,55 @@ style_tostring(struct style *sy)
 		    colour_tostring(gc->bg));
 		comma = ",";
 	}
+	if (gc->us != 8) {
+		off += xsnprintf(s + off, sizeof s - off, "%sus=%s", comma,
+		    colour_tostring(gc->us));
+		comma = ",";
+	}
 	if (gc->attr != 0) {
-		xsnprintf(s + off, sizeof s - off, "%s%s", comma,
+		off += xsnprintf(s + off, sizeof s - off, "%s%s", comma,
 		    attributes_tostring(gc->attr));
 		comma = ",";
 	}
-
+	if (sy->width >= 0) {
+		if (sy->width_percentage)
+			off += xsnprintf(s + off, sizeof s - off,
+			    "%swidth=%u%%", comma, sy->width);
+		else
+			off += xsnprintf(s + off, sizeof s - off,
+			    "%swidth=%u", comma, sy->width);
+		comma = ",";
+	}
+	if (sy->pad >= 0) {
+		off += xsnprintf(s + off, sizeof s - off, "%spad=%u", comma,
+		    sy->pad);
+		comma = ",";
+	}
+	uri = style_link(sy);
+	if (uri != NULL) {
+		xsnprintf(s + off, sizeof s - off, "%slink=%s", comma, uri);
+		comma = ",";
+	}
 	if (*s == '\0')
 		return ("default");
 	return (s);
 }
 
+/* Get the hyperlink URI for a style, or NULL if it has none. */
+const char *
+style_link(struct style *sy)
+{
+	const char	*uri;
+
+	if (sy->link == 0 || style_hyperlinks == NULL)
+		return (NULL);
+	if (!hyperlinks_get(style_hyperlinks, sy->link, &uri, NULL, NULL))
+		return (NULL);
+	return (uri);
+}
+
 /* Apply a style on top of the given style. */
-void
+struct style *
 style_add(struct grid_cell *gc, struct options *oo, const char *name,
     struct format_tree *ft)
 {
@@ -287,10 +456,13 @@ style_add(struct grid_cell *gc, struct options *oo, const char *name,
 		gc->fg = sy->gc.fg;
 	if (sy->gc.bg != 8)
 		gc->bg = sy->gc.bg;
+	if (sy->gc.us != 8)
+		gc->us = sy->gc.us;
 	gc->attr |= sy->gc.attr;
 
 	if (ft0 != NULL)
 		format_free(ft0);
+	return (sy);
 }
 
 /* Apply a style on top of the default style. */
@@ -300,6 +472,29 @@ style_apply(struct grid_cell *gc, struct options *oo, const char *name,
 {
 	memcpy(gc, &grid_default_cell, sizeof *gc);
 	style_add(gc, oo, name, ft);
+}
+
+/* Parse a single colour into a style */
+int
+style_parse_colour(struct style *sy, const struct grid_cell *base,
+    const char *s)
+{
+	int	c;
+
+	style_set(sy, base);
+
+	if (*s == '\0') {
+		sy->gc.fg = -1;
+		return (0);
+	}
+
+	if ((c = colour_fromstring(s)) == -1)
+		return (-1);
+	if (c == 8)
+		sy->gc.fg = base->fg;
+	else
+		sy->gc.fg = c;
+	return (0);
 }
 
 /* Initialize style from cell. */
@@ -315,4 +510,87 @@ void
 style_copy(struct style *dst, struct style *src)
 {
 	memcpy(dst, src, sizeof *dst);
+}
+
+/* Set scrollbar style from an option. */
+void
+style_set_scrollbar_style_from_option(struct style *sb_style,
+    struct options *oo)
+{
+	const struct options_table_entry	*oe;
+	struct options_entry			*o;
+	const char				*s;
+	char					*style, *expanded;
+
+	style_set(sb_style, &grid_default_cell);
+	o = options_get(oo, "pane-scrollbars-style");
+	if (o == NULL)
+		fatalx("missing pane-scrollbars-style");
+	oe = options_table_entry(o);
+	style = format_single(NULL, oe->default_str, NULL, NULL, NULL, NULL);
+	if (style_parse(sb_style, &grid_default_cell, style) != 0)
+		fatalx("bad pane-scrollbars-style default");
+
+	s = options_get_string(oo, "pane-scrollbars-style");
+	if (s != NULL) {
+		expanded = format_single(NULL, s, NULL, NULL, NULL, NULL);
+		if (style_parse(sb_style, &grid_default_cell, expanded) != 0)
+			style_parse(sb_style, &grid_default_cell, style);
+		free(expanded);
+	}
+	free(style);
+	if (sb_style->width < 1)
+		sb_style->width = PANE_SCROLLBARS_DEFAULT_WIDTH;
+	if (sb_style->pad < 0)
+		sb_style->pad = PANE_SCROLLBARS_DEFAULT_PADDING;
+	utf8_set(&sb_style->gc.data, PANE_SCROLLBARS_CHARACTER);
+}
+
+/* Initialize style ranges. */
+void
+style_ranges_init(struct style_ranges *srs)
+{
+	TAILQ_INIT(srs);
+}
+
+/* Free style ranges. */
+void
+style_ranges_free(struct style_ranges *srs)
+{
+	struct style_range	*sr, *sr1;
+
+	TAILQ_FOREACH_SAFE(sr, srs, entry, sr1) {
+		TAILQ_REMOVE(srs, sr, entry);
+		free(sr);
+	}
+}
+
+/* Get range for position from style ranges. */
+struct style_range *
+style_ranges_get_range(struct style_ranges *srs, u_int x)
+{
+	struct style_range	*sr;
+
+	if (srs == NULL)
+		return (NULL);
+	TAILQ_FOREACH(sr, srs, entry) {
+		if (x >= sr->start && x < sr->end)
+			return (sr);
+	}
+	return (NULL);
+}
+
+/* Get range for position and row from style ranges. */
+struct style_range *
+style_ranges_get_range_at(struct style_ranges *srs, u_int x, u_int y)
+{
+	struct style_range	*sr;
+
+	if (srs == NULL)
+		return (NULL);
+	TAILQ_FOREACH(sr, srs, entry) {
+		if (x >= sr->start && x < sr->end && y == sr->y)
+			return (sr);
+	}
+	return (NULL);
 }

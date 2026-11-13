@@ -1,14 +1,17 @@
 #!/bin/sh
 
+. ./regress-common.inc
+
 # new session environment
 
 PATH=/bin:/usr/bin
-TERM=screen
 
 [ -z "$TEST_TMUX" ] && TEST_TMUX=$(readlink -f ../tmux)
-TMUX="$TEST_TMUX -Ltest"
-$TMUX kill-server 2>/dev/null
+TMUX="$TEST_TMUX -LtestA$$ -f/dev/null"
+stop_server $TMUX || exit 1
 
+TERM=$($TMUX start \; set -s exit-empty off \; show -gv default-terminal)
+stop_server $TMUX || exit 1
 TMP=$(mktemp)
 OUT=$(mktemp)
 SCRIPT=$(mktemp)
@@ -32,7 +35,7 @@ EOF
 	$TMUX -f$TMP start) || exit 1
 sleep 1
 (cat <<EOF|cmp -s - $OUT) || exit 1
-TERM=screen
+TERM=$TERM
 PWD=/
 PATH=1
 SHELL=/bin/sh
@@ -43,7 +46,7 @@ EOF
 	$TMUX -f$TMP new -d -- /bin/sh $SCRIPT) || exit 1
 sleep 1
 (cat <<EOF|cmp -s - $OUT) || exit 1
-TERM=screen
+TERM=$TERM
 PWD=/
 PATH=2
 SHELL=/bin/sh
@@ -54,13 +57,13 @@ EOF
 	$TMUX -f/dev/null new -d source $TMP) || exit 1
 sleep 1
 (cat <<EOF|cmp -s - $OUT) || exit 1
-TERM=screen
+TERM=$TERM
 PWD=/
 PATH=2
 SHELL=/bin/sh
 TEST=test2
 EOF
 
-$TMUX kill-server 2>/dev/null
+stop_server $TMUX || exit 1
 
 exit 0

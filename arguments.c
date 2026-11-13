@@ -1,4 +1,4 @@
-/* $OpenBSD$ */
+/* $OpenBSD: arguments.c,v 1.67 2026/08/25 06:04:33 nicm Exp $ */
 
 /*
  * Copyright (c) 2010 Nicholas Marriott <nicholas.marriott@gmail.com>
@@ -37,6 +37,10 @@ struct args_entry {
 	u_char			 flag;
 	struct args_values	 values;
 	u_int			 count;
+
+	int			 flags;
+#define ARGS_ENTRY_OPTIONAL_VALUE 0x1
+
 	RB_ENTRY(args_entry)	 entry;
 };
 
@@ -94,6 +98,22 @@ args_copy_value(struct args_value *to, struct args_value *from)
 	}
 }
 
+/* Type to string. */
+static const char *
+args_type_to_string (enum args_type type)
+{
+	switch (type)
+	{
+	case ARGS_NONE:
+		return "NONE";
+	case ARGS_STRING:
+		return "STRING";
+	case ARGS_COMMANDS:
+		return "COMMANDS";
+	}
+	return "INVALID";
+}
+
 /* Get value as string. */
 static const char *
 args_value_as_string(struct args_value *value)
@@ -122,6 +142,115 @@ args_create(void)
 	return (args);
 }
 
+/* Parse a single flag. */
+static int
+args_parse_flag_argument(struct args_value *values, u_int count, char **cause,
+    struct args *args, u_int *i, const char *string, int flag,
+    int optional_argument)
+{
+	struct args_value	*argument, *new;
+	const char		*s, *as;
+
+	new = xcalloc(1, sizeof *new);
+	if (*string != '\0') {
+		new->type = ARGS_STRING;
+		new->string = xstrdup(string);
+		goto out;
+	}
+
+	if (*i == count)
+		argument = NULL;
+	else {
+		argument = &values[*i];
+		if (argument->type != ARGS_STRING) {
+			xasprintf(cause, "-%c argument must be a string", flag);
+			args_free_value(new);
+			free(new);
+			return (-1);
+		}
+	}
+	if (argument == NULL) {
+		args_free_value(new);
+		free(new);
+		if (optional_argument) {
+			log_debug("%s: -%c (optional)", __func__, flag);
+			args_set(args, flag, NULL, ARGS_ENTRY_OPTIONAL_VALUE);
+			return (0); /* either - or end */
+		}
+		xasprintf(cause, "-%c expects an argument", flag);
+		return (-1);
+	}
+
+	if (optional_argument && argument->type == ARGS_STRING) {
+		as = argument->string;
+		if (as[0] == '-' && (as[1] == '-' || isalpha((u_char)as[1]))) {
+			args_free_value(new);
+			free(new);
+			log_debug("%s: -%c (optional)", __func__, flag);
+			args_set(args, flag, NULL, ARGS_ENTRY_OPTIONAL_VALUE);
+			return (0);
+		}
+	}
+	args_copy_value(new, argument);
+	(*i)++;
+
+out:
+	s = args_value_as_string(new);
+	log_debug("%s: -%c = %s", __func__, flag, s);
+
+	args_set(args, flag, new, 0);
+	return (0);
+}
+
+/* Parse flags argument. */
+static int
+args_parse_flags(const struct args_parse *parse, struct args_value *values,
+    u_int count, char **cause, struct args *args, u_int *i)
+{
+	struct args_value	*value;
+	u_char			 flag;
+	const char		*found, *string;
+	int			 optional_argument;
+
+	value = &values[*i];
+	if (value->type != ARGS_STRING)
+		return (1);
+
+	string = value->string;
+	log_debug("%s: next %s", __func__, string);
+	if (*string++ != '-' || *string == '\0')
+		return (1);
+	(*i)++;
+	if (string[0] == '-' && string[1] == '\0')
+		return (1);
+
+	for (;;) {
+		flag = *string++;
+		if (flag == '\0')
+			return (0);
+		if (flag == '?')
+			return (-1);
+		if (!isalnum(flag)) {
+			xasprintf(cause, "invalid flag -%c", flag);
+			return (-1);
+		}
+
+		found = strchr(parse->template, flag);
+		if (found == NULL) {
+			xasprintf(cause, "unknown flag -%c", flag);
+			return (-1);
+		}
+		if (found[1] != ':') {
+			log_debug("%s: -%c", __func__, flag);
+			args_set(args, flag, NULL, 0);
+			continue;
+		}
+		optional_argument = (found[2] == ':');
+		return (args_parse_flag_argument(values, count, cause, args, i,
+		    string, flag, optional_argument));
+	}
+}
+
 /* Parse arguments into a new argument set. */
 struct args *
 args_parse(const struct args_parse *parse, struct args_value *values,
@@ -131,86 +260,21 @@ args_parse(const struct args_parse *parse, struct args_value *values,
 	u_int			 i;
 	enum args_parse_type	 type;
 	struct args_value	*value, *new;
-	u_char			 flag;
-	const char		*found, *string, *s;
-	int			 optional_argument;
+	const char		*s;
+	int			 stop;
 
 	if (count == 0)
 		return (args_create());
 
 	args = args_create();
 	for (i = 1; i < count; /* nothing */) {
-		value = &values[i];
-		if (value->type != ARGS_STRING)
-			break;
-
-		string = value->string;
-		if (*string++ != '-' || *string == '\0')
-			break;
-		i++;
-		if (string[0] == '-' && string[1] == '\0')
-			break;
-
-		for (;;) {
-			flag = *string++;
-			if (flag == '\0')
-				break;
-			if (flag == '?') {
-				args_free(args);
-				return (NULL);
-			}
-			if (!isalnum(flag)) {
-				xasprintf(cause, "invalid flag -%c", flag);
-				args_free(args);
-				return (NULL);
-			}
-			found = strchr(parse->template, flag);
-			if (found == NULL) {
-				xasprintf(cause, "unknown flag -%c", flag);
-				args_free(args);
-				return (NULL);
-			}
-			if (*++found != ':') {
-				log_debug("%s: -%c", __func__, flag);
-				args_set(args, flag, NULL);
-				continue;
-			}
-			if (*found == ':') {
-				optional_argument = 1;
-				found++;
-			}
-			new = xcalloc(1, sizeof *new);
-			if (*string != '\0') {
-				new->type = ARGS_STRING;
-				new->string = xstrdup(string);
-			} else {
-				if (i == count) {
-					if (optional_argument) {
-						log_debug("%s: -%c", __func__,
-						    flag);
-						args_set(args, flag, NULL);
-						continue;
-					}
-					xasprintf(cause,
-					    "-%c expects an argument",
-					    flag);
-					args_free(args);
-					return (NULL);
-				}
-				if (values[i].type != ARGS_STRING) {
-					xasprintf(cause,
-					    "-%c argument must be a string",
-					    flag);
-					args_free(args);
-					return (NULL);
-				}
-				args_copy_value(new, &values[i++]);
-			}
-			s = args_value_as_string(new);
-			log_debug("%s: -%c = %s", __func__, flag, s);
-			args_set(args, flag, new);
-			break;
+		stop = args_parse_flags(parse, values, count, cause, args, &i);
+		if (stop == -1) {
+			args_free(args);
+			return (NULL);
 		}
+		if (stop == 1)
+			break;
 	}
 	log_debug("%s: flags end at %u of %u", __func__, i, count);
 	if (i != count) {
@@ -218,8 +282,8 @@ args_parse(const struct args_parse *parse, struct args_value *values,
 			value = &values[i];
 
 			s = args_value_as_string(value);
-			log_debug("%s: %u = %s (type %d)", __func__, i, s,
-			    value->type);
+			log_debug("%s: %u = %s (type %s)", __func__, i, s,
+			    args_type_to_string (value->type));
 
 			if (parse->cb != NULL) {
 				type = parse->cb(args, args->count, cause);
@@ -323,13 +387,13 @@ args_copy(struct args *args, int argc, char **argv)
 	RB_FOREACH(entry, args_tree, &args->tree) {
 		if (TAILQ_EMPTY(&entry->values)) {
 			for (i = 0; i < entry->count; i++)
-				args_set(new_args, entry->flag, NULL);
+				args_set(new_args, entry->flag, NULL, 0);
 			continue;
 		}
 		TAILQ_FOREACH(value, &entry->values, entry) {
 			new_value = xcalloc(1, sizeof *new_value);
 			args_copy_copy_value(new_value, value, argc, argv);
-			args_set(new_args, entry->flag, new_value);
+			args_set(new_args, entry->flag, new_value, 0);
 		}
 	}
 	if (args->count == 0)
@@ -487,6 +551,7 @@ args_print(struct args *args)
 	char			*buf;
 	u_int			 i, j;
 	struct args_entry	*entry;
+	struct args_entry	*last = NULL;
 	struct args_value	*value;
 
 	len = 1;
@@ -494,6 +559,8 @@ args_print(struct args *args)
 
 	/* Process the flags first. */
 	RB_FOREACH(entry, args_tree, &args->tree) {
+		if (entry->flags & ARGS_ENTRY_OPTIONAL_VALUE)
+			continue;
 		if (!TAILQ_EMPTY(&entry->values))
 			continue;
 
@@ -505,6 +572,16 @@ args_print(struct args *args)
 
 	/* Then the flags with arguments. */
 	RB_FOREACH(entry, args_tree, &args->tree) {
+		if (entry->flags & ARGS_ENTRY_OPTIONAL_VALUE) {
+			if (*buf != '\0')
+				args_print_add(&buf, &len, " -%c", entry->flag);
+			else
+				args_print_add(&buf, &len, "-%c", entry->flag);
+			last = entry;
+			continue;
+		}
+		if (TAILQ_EMPTY(&entry->values))
+			continue;
 		TAILQ_FOREACH(value, &entry->values, entry) {
 			if (*buf != '\0')
 				args_print_add(&buf, &len, " -%c", entry->flag);
@@ -512,7 +589,10 @@ args_print(struct args *args)
 				args_print_add(&buf, &len, "-%c", entry->flag);
 			args_print_add_value(&buf, &len, value);
 		}
+		last = entry;
 	}
+	if (last && (last->flags & ARGS_ENTRY_OPTIONAL_VALUE))
+		args_print_add(&buf, &len, " --");
 
 	/* And finally the argument vector. */
 	for (i = 0; i < args->count; i++)
@@ -582,7 +662,7 @@ args_has(struct args *args, u_char flag)
 
 /* Set argument value in the arguments tree. */
 void
-args_set(struct args *args, u_char flag, struct args_value *value)
+args_set(struct args *args, u_char flag, struct args_value *value, int flags)
 {
 	struct args_entry	*entry;
 
@@ -591,12 +671,15 @@ args_set(struct args *args, u_char flag, struct args_value *value)
 		entry = xcalloc(1, sizeof *entry);
 		entry->flag = flag;
 		entry->count = 1;
+		entry->flags = flags;
 		TAILQ_INIT(&entry->values);
 		RB_INSERT(args_tree, &args->tree, entry);
 	} else
 		entry->count++;
 	if (value != NULL && value->type != ARGS_NONE)
 		TAILQ_INSERT_TAIL(&entry->values, value, entry);
+	else
+		free(value);
 }
 
 /* Get argument value. Will be NULL if it isn't present. */
@@ -679,8 +762,6 @@ args_make_commands_now(struct cmd *self, struct cmdq_item *item, u_int idx,
 		cmdq_error(item, "%s", error);
 		free(error);
 	}
-	else
-		cmdlist->references++;
 	args_make_commands_free(state);
 	return (cmdlist);
 }
@@ -696,6 +777,7 @@ args_make_commands_prepare(struct cmd *self, struct cmdq_item *item, u_int idx,
 	struct args_value		*value;
 	struct args_command_state	*state;
 	const char			*cmd;
+	const char			*file;
 
 	state = xcalloc(1, sizeof *state);
 
@@ -722,7 +804,9 @@ args_make_commands_prepare(struct cmd *self, struct cmdq_item *item, u_int idx,
 
 	if (wait)
 		state->pi.item = item;
-	cmd_get_source(self, &state->pi.file, &state->pi.line);
+	cmd_get_source(self, &file, &state->pi.line);
+	if (file != NULL)
+		state->pi.file = xstrdup(file);
 	state->pi.c = tc;
 	if (state->pi.c != NULL)
 		state->pi.c->references++;
@@ -741,12 +825,16 @@ args_make_commands(struct args_command_state *state, int argc, char **argv,
 	int			 i;
 
 	if (state->cmdlist != NULL) {
-		if (argc == 0)
+		if (argc == 0) {
+			state->cmdlist->references++;
 			return (state->cmdlist);
+		}
 		return (cmd_list_copy(state->cmdlist, argc, argv));
 	}
 
 	cmd = xstrdup(state->cmd);
+	log_debug("%s: %s", __func__, cmd);
+	cmd_log_argv(argc, argv, __func__);
 	for (i = 0; i < argc; i++) {
 		new_cmd = cmd_template_replace(cmd, argv[i], i + 1);
 		log_debug("%s: %%%u %s: %s", __func__, i + 1, argv[i], new_cmd);
@@ -775,6 +863,7 @@ args_make_commands_free(struct args_command_state *state)
 		cmd_list_free(state->cmdlist);
 	if (state->pi.c != NULL)
 		server_client_unref(state->pi.c);
+	free((void *)state->pi.file);
 	free(state->cmd);
 	free(state);
 }
@@ -895,6 +984,10 @@ args_percentage(struct args *args, u_char flag, long long minval,
 		*cause = xstrdup("missing");
 		return (0);
 	}
+	if (TAILQ_EMPTY(&entry->values)) {
+		*cause = xstrdup("empty");
+		return (0);
+	}
 	value = TAILQ_LAST(&entry->values, args_values)->string;
 	return (args_string_percentage(value, minval, maxval, curval, cause));
 }
@@ -909,11 +1002,15 @@ args_string_percentage(const char *value, long long minval, long long maxval,
 	size_t		 valuelen = strlen(value);
 	char		*copy;
 
+	if (valuelen == 0) {
+		*cause = xstrdup("empty");
+		return (0);
+	}
 	if (value[valuelen - 1] == '%') {
 		copy = xstrdup(value);
 		copy[valuelen - 1] = '\0';
 
-		ll = strtonum(copy, 0, 100, &errstr);
+		ll = strtonum(copy, 0, 1000, &errstr);
 		free(copy);
 		if (errstr != NULL) {
 			*cause = xstrdup(errstr);
@@ -955,6 +1052,10 @@ args_percentage_and_expand(struct args *args, u_char flag, long long minval,
 		*cause = xstrdup("missing");
 		return (0);
 	}
+	if (TAILQ_EMPTY(&entry->values)) {
+		*cause = xstrdup("empty");
+		return (0);
+	}
 	value = TAILQ_LAST(&entry->values, args_values)->string;
 	return (args_string_percentage_and_expand(value, minval, maxval, curval,
 		    item, cause));
@@ -977,7 +1078,7 @@ args_string_percentage_and_expand(const char *value, long long minval,
 		copy[valuelen - 1] = '\0';
 
 		f = format_single_from_target(item, copy);
-		ll = strtonum(f, 0, 100, &errstr);
+		ll = strtonum(f, 0, 1000, &errstr);
 		free(f);
 		free(copy);
 		if (errstr != NULL) {

@@ -1,4 +1,4 @@
-/* $OpenBSD$ */
+/* $OpenBSD: environ.c,v 1.31 2026/06/13 20:07:30 nicm Exp $ */
 
 /*
  * Copyright (c) 2009 Nicholas Marriott <nicholas.marriott@gmail.com>
@@ -56,6 +56,9 @@ void
 environ_free(struct environ *env)
 {
 	struct environ_entry	*envent, *envent1;
+
+	if (env == NULL)
+		return;
 
 	RB_FOREACH_SAFE(envent, environ, env, envent1) {
 		RB_REMOVE(environ, env, envent);
@@ -149,7 +152,8 @@ environ_clear(struct environ *env, const char *name)
 void
 environ_put(struct environ *env, const char *var, int flags)
 {
-	char	*name, *value;
+	char		*name;
+	const char	*value;
 
 	value = strchr(var, '=');
 	if (value == NULL)
@@ -182,9 +186,11 @@ void
 environ_update(struct options *oo, struct environ *src, struct environ *dst)
 {
 	struct environ_entry		*envent;
+	struct environ_entry		*envent1;
 	struct options_entry		*o;
 	struct options_array_item	*a;
 	union options_value		*ov;
+	int				 found;
 
 	o = options_get(oo, "update-environment");
 	if (o == NULL)
@@ -192,14 +198,15 @@ environ_update(struct options *oo, struct environ *src, struct environ *dst)
 	a = options_array_first(o);
 	while (a != NULL) {
 		ov = options_array_item_value(a);
-		RB_FOREACH(envent, environ, src) {
-			if (fnmatch(ov->string, envent->name, 0) == 0)
-				break;
+		found = 0;
+		RB_FOREACH_SAFE(envent, environ, src, envent1) {
+			if (fnmatch(ov->string, envent->name, 0) == 0) {
+				environ_set(dst, envent->name, 0, "%s", envent->value);
+				found = 1;
+			}
 		}
-		if (envent == NULL)
+		if (!found)
 			environ_clear(dst, ov->string);
-		else
-			environ_set(dst, envent->name, 0, "%s", envent->value);
 		a = options_array_next(a);
 	}
 }
@@ -259,7 +266,14 @@ environ_for_session(struct session *s, int no_TERM)
 		environ_set(env, "TERM", 0, "%s", value);
 		environ_set(env, "TERM_PROGRAM", 0, "%s", "tmux");
 		environ_set(env, "TERM_PROGRAM_VERSION", 0, "%s", getversion());
+		environ_set(env, "COLORTERM", 0, "truecolor");
 	}
+
+#ifdef HAVE_SYSTEMD
+	environ_clear(env, "LISTEN_PID");
+	environ_clear(env, "LISTEN_FDS");
+	environ_clear(env, "LISTEN_FDNAMES");
+#endif
 
 	if (s != NULL)
 		idx = s->id;

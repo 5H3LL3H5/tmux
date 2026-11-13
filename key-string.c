@@ -1,4 +1,4 @@
-/* $OpenBSD$ */
+/* $OpenBSD: key-string.c,v 1.80 2026/11/12 11:26:25 nicm Exp $ */
 
 /*
  * Copyright (c) 2007 Nicholas Marriott <nicholas.marriott@gmail.com>
@@ -18,6 +18,7 @@
 
 #include <sys/types.h>
 
+#include <ctype.h>
 #include <stdlib.h>
 #include <string.h>
 #include <wchar.h>
@@ -56,12 +57,47 @@ static const struct {
 	{ "PPage",	KEYC_PPAGE|KEYC_IMPLIED_META },
 	{ "PageUp",	KEYC_PPAGE|KEYC_IMPLIED_META },
 	{ "PgUp",	KEYC_PPAGE|KEYC_IMPLIED_META },
-	{ "Tab",	'\011' },
 	{ "BTab",	KEYC_BTAB },
 	{ "Space",	' ' },
 	{ "BSpace",	KEYC_BSPACE },
-	{ "Enter",	'\r' },
-	{ "Escape",	'\033' },
+
+	/*
+	 * C0 control characters, with the exception of Tab, Enter,
+	 * and Esc, should never appear as keys. We still render them,
+	 * so to be able to spot them in logs in case of an abnormality.
+	 */
+	{ "[NUL]",	C0_NUL },
+	{ "[SOH]",	C0_SOH },
+	{ "[STX]",	C0_STX },
+	{ "[ETX]",	C0_ETX },
+	{ "[EOT]",	C0_EOT },
+	{ "[ENQ]",	C0_ENQ },
+	{ "[ASC]",	C0_ASC },
+	{ "[BEL]",	C0_BEL },
+	{ "[BS]",	C0_BS },
+	{ "Tab",	C0_HT },
+	{ "[LF]",	C0_LF },
+	{ "[VT]",	C0_VT },
+	{ "[FF]",	C0_FF },
+	{ "Enter",	C0_CR },
+	{ "[SO]",	C0_SO },
+	{ "[SI]",	C0_SI },
+	{ "[DLE]",	C0_DLE },
+	{ "[DC1]",	C0_DC1 },
+	{ "[DC2]",	C0_DC2 },
+	{ "[DC3]",	C0_DC3 },
+	{ "[DC4]",	C0_DC4 },
+	{ "[NAK]",	C0_NAK },
+	{ "[SYN]",	C0_SYN },
+	{ "[ETB]",	C0_ETB },
+	{ "[CAN]",	C0_CAN },
+	{ "[EM]",	C0_EM },
+	{ "[SUB]",	C0_SUB },
+	{ "Escape",	C0_ESC },
+	{ "[FS]",	C0_FS },
+	{ "[GS]",	C0_GS },
+	{ "[RS]",	C0_RS },
+	{ "[US]",	C0_US },
 
 	/* Arrow keys. */
 	{ "Up",		KEYC_UP|KEYC_CURSOR|KEYC_IMPLIED_META },
@@ -88,6 +124,21 @@ static const struct {
 	{ "KP.",	KEYC_KP_PERIOD|KEYC_KEYPAD },
 
 	/* Mouse keys. */
+	{ "MouseMoveSideStatus", KEYC_MOUSEMOVE_SIDE_STATUS },
+	{ "MouseMoveSideStatusLeft", KEYC_MOUSEMOVE_SIDE_STATUS_LEFT },
+	{ "MouseMoveSideStatusRight", KEYC_MOUSEMOVE_SIDE_STATUS_RIGHT },
+	{ "MouseMoveSideStatusDefault", KEYC_MOUSEMOVE_SIDE_STATUS_DEFAULT },
+	{ "MouseMoveSideStatusBorder", KEYC_MOUSEMOVE_SIDE_STATUS_BORDER },
+	{ "MouseMoveSideStatusControl0", KEYC_MOUSEMOVE_SIDE_STATUS_CONTROL0 },
+	{ "MouseMoveSideStatusControl1", KEYC_MOUSEMOVE_SIDE_STATUS_CONTROL1 },
+	{ "MouseMoveSideStatusControl2", KEYC_MOUSEMOVE_SIDE_STATUS_CONTROL2 },
+	{ "MouseMoveSideStatusControl3", KEYC_MOUSEMOVE_SIDE_STATUS_CONTROL3 },
+	{ "MouseMoveSideStatusControl4", KEYC_MOUSEMOVE_SIDE_STATUS_CONTROL4 },
+	{ "MouseMoveSideStatusControl5", KEYC_MOUSEMOVE_SIDE_STATUS_CONTROL5 },
+	{ "MouseMoveSideStatusControl6", KEYC_MOUSEMOVE_SIDE_STATUS_CONTROL6 },
+	{ "MouseMoveSideStatusControl7", KEYC_MOUSEMOVE_SIDE_STATUS_CONTROL7 },
+	{ "MouseMoveSideStatusControl8", KEYC_MOUSEMOVE_SIDE_STATUS_CONTROL8 },
+	{ "MouseMoveSideStatusControl9", KEYC_MOUSEMOVE_SIDE_STATUS_CONTROL9 },
 	KEYC_MOUSE_STRING(MOUSEDOWN1, MouseDown1),
 	KEYC_MOUSE_STRING(MOUSEDOWN2, MouseDown2),
 	KEYC_MOUSE_STRING(MOUSEDOWN3, MouseDown3),
@@ -160,15 +211,17 @@ static key_code
 key_string_search_table(const char *string)
 {
 	u_int	i, user;
+	int	n;
 
 	for (i = 0; i < nitems(key_string_table); i++) {
 		if (strcasecmp(string, key_string_table[i].string) == 0)
 			return (key_string_table[i].key);
 	}
 
-	if (sscanf(string, "User%u", &user) == 1 && user < KEYC_NUSER)
+	if (sscanf(string, "User%u%n", &user, &n) == 1 &&
+	    string[n] == '\0' &&
+	    user <= KEYC_NUSER)
 		return (KEYC_USER + user);
-
 	return (KEYC_UNKNOWN);
 }
 
@@ -206,8 +259,7 @@ key_string_get_modifiers(const char **string)
 key_code
 key_string_lookup_string(const char *string)
 {
-	static const char	*other = "!#()+,-.0123456789:;<=>'\r\t\177`/";
-	key_code		 key, modifiers;
+	key_code		 key, modifiers = 0;
 	u_int			 u, i;
 	struct utf8_data	 ud, *udp;
 	enum utf8_state		 more;
@@ -244,12 +296,15 @@ key_string_lookup_string(const char *string)
 		return (uc);
 	}
 
-	/* Check for modifiers. */
-	modifiers = 0;
+	/* Check for short Ctrl key. */
 	if (string[0] == '^' && string[1] != '\0') {
+		if (string[2] == '\0')
+			return (tolower((u_char)string[1])|KEYC_CTRL);
 		modifiers |= KEYC_CTRL;
 		string++;
 	}
+
+	/* Check for modifiers. */
 	modifiers |= key_string_get_modifiers(&string);
 	if (string == NULL || string[0] == '\0')
 		return (KEYC_UNKNOWN);
@@ -281,26 +336,6 @@ key_string_lookup_string(const char *string)
 			key &= ~KEYC_IMPLIED_META;
 	}
 
-	/* Convert the standard control keys. */
-	if (key <= 127 &&
-	    (modifiers & KEYC_CTRL) &&
-	    strchr(other, key) == NULL &&
-	    key != 9 &&
-	    key != 13 &&
-	    key != 27) {
-		if (key >= 97 && key <= 122)
-			key -= 96;
-		else if (key >= 64 && key <= 95)
-                       key -= 64;
-		else if (key == 32)
-			key = 0;
-		else if (key == 63)
-			key = 127;
-		else
-			return (KEYC_UNKNOWN);
-		modifiers &= ~KEYC_CTRL;
-	}
-
 	return (key|modifiers);
 }
 
@@ -310,7 +345,7 @@ key_string_lookup_key(key_code key, int with_flags)
 {
 	key_code		 saved = key;
 	static char		 out[64];
-	char			 tmp[8];
+	char			 tmp[16];
 	const char		*s;
 	u_int			 i;
 	struct utf8_data	 ud;
@@ -323,10 +358,6 @@ key_string_lookup_key(key_code key, int with_flags)
 		snprintf(out, sizeof out, "%c", (int)(key & 0xff));
 		goto out;
 	}
-
-	/* Display C-@ as C-Space. */
-	if ((key & (KEYC_MASK_KEY|KEYC_MASK_MODIFIERS)) == 0)
-		key = ' '|KEYC_CTRL;
 
 	/* Fill in the modifiers. */
 	if (key & KEYC_CTRL)
@@ -368,6 +399,14 @@ key_string_lookup_key(key_code key, int with_flags)
 		s = "PasteEnd";
 		goto append;
 	}
+	if (key == KEYC_REPORT_DARK_THEME) {
+		s = "ReportDarkTheme";
+		goto append;
+	}
+	if (key == KEYC_REPORT_LIGHT_THEME) {
+		s = "ReportLightTheme";
+		goto append;
+	}
 	if (key == KEYC_MOUSE) {
 		s = "Mouse";
 		goto append;
@@ -396,7 +435,7 @@ key_string_lookup_key(key_code key, int with_flags)
 		s = "MouseMoveBorder";
 		goto append;
 	}
-	if (key >= KEYC_USER && key < KEYC_USER + KEYC_NUSER) {
+	if (KEYC_IS_USER(key)) {
 		snprintf(tmp, sizeof tmp, "User%u", (u_int)(key - KEYC_USER));
 		strlcat(out, tmp, sizeof out);
 		goto out;
@@ -427,13 +466,8 @@ key_string_lookup_key(key_code key, int with_flags)
 		goto out;
 	}
 
-	/* Check for standard or control key. */
-	if (key <= 32) {
-		if (key == 0 || key > 26)
-			xsnprintf(tmp, sizeof tmp, "C-%c", (int)(64 + key));
-		else
-			xsnprintf(tmp, sizeof tmp, "C-%c", (int)(96 + key));
-	} else if (key >= 32 && key <= 126) {
+	/* Printable ASCII keys. */
+	if (key > 32 && key <= 126) {
 		tmp[0] = key;
 		tmp[1] = '\0';
 	} else if (key == 127)
@@ -460,6 +494,8 @@ out:
 			strlcat(out, "I", sizeof out);
 		if (saved & KEYC_BUILD_MODIFIERS)
 			strlcat(out, "B", sizeof out);
+		if (saved & KEYC_SENT)
+			strlcat(out, "S", sizeof out);
 		strlcat(out, "]", sizeof out);
 	}
 	return (out);

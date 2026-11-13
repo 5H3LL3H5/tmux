@@ -1,4 +1,4 @@
-/* $OpenBSD$ */
+/* $OpenBSD: server.c,v 1.217 2026/10/23 06:45:15 nicm Exp $ */
 
 /*
  * Copyright (c) 2007 Nicholas Marriott <nicholas.marriott@gmail.com>
@@ -70,7 +70,8 @@ server_set_marked(struct session *s, struct winlink *wl, struct window_pane *wp)
 	cmd_find_clear_state(&marked_pane, 0);
 	marked_pane.s = s;
 	marked_pane.wl = wl;
-	marked_pane.w = wl->window;
+	if (wl != NULL)
+		marked_pane.w = wl->window;
 	marked_pane.wp = wp;
 }
 
@@ -103,7 +104,7 @@ server_check_marked(void)
 
 /* Create server socket. */
 int
-server_create_socket(int flags, char **cause)
+server_create_socket(uint64_t flags, char **cause)
 {
 	struct sockaddr_un	sa;
 	size_t			size;
@@ -128,6 +129,7 @@ server_create_socket(int flags, char **cause)
 		mask = umask(S_IXUSR|S_IRWXG|S_IRWXO);
 	if (bind(fd, (struct sockaddr *)&sa, sizeof sa) == -1) {
 		saved_errno = errno;
+		umask(mask);
 		close(fd);
 		errno = saved_errno;
 		goto fail;
@@ -172,7 +174,7 @@ server_tidy_event(__unused int fd, __unused short events, __unused void *data)
 
 /* Fork new server. */
 int
-server_start(struct tmuxproc *client, int flags, struct event_base *base,
+server_start(struct tmuxproc *client, uint64_t flags, struct event_base *base,
     int lockfd, char *lockfile)
 {
 	int		 fd;
@@ -207,13 +209,20 @@ server_start(struct tmuxproc *client, int flags, struct event_base *base,
 		fatal("pledge failed");
 
 	input_key_build();
+	utf8_update_width_cache();
 	RB_INIT(&windows);
 	RB_INIT(&all_window_panes);
 	TAILQ_INIT(&clients);
 	RB_INIT(&sessions);
 	key_bindings_init();
+	control_build_events();
+	hooks_build_events();
 	TAILQ_INIT(&message_log);
 	gettimeofday(&start_time, NULL);
+
+#ifdef HAVE_KEYCTL
+	fork_session_keyring();
+#endif
 
 #ifdef HAVE_SYSTEMD
 	server_fd = systemd_create_socket(flags, &cause);
@@ -236,6 +245,7 @@ server_start(struct tmuxproc *client, int flags, struct event_base *base,
 	if (cause != NULL) {
 		if (c != NULL) {
 			c->exit_message = cause;
+			c->retval = 1;
 			c->flags |= CLIENT_EXIT;
 		} else {
 			fprintf(stderr, "%s\n", cause);
@@ -252,7 +262,7 @@ server_start(struct tmuxproc *client, int flags, struct event_base *base,
 	proc_loop(server_proc, server_loop);
 
 	job_kill_all();
-	status_prompt_save_history();
+	prompt_save_history();
 
 	exit(0);
 }
@@ -264,7 +274,7 @@ server_loop(void)
 	struct client	*c;
 	u_int		 items;
 
-	current_time = time (NULL);
+	current_time = time(NULL);
 
 	do {
 		items = cmdq_next(NULL);
@@ -272,6 +282,8 @@ server_loop(void)
 			if (c->flags & CLIENT_IDENTIFIED)
 				items += cmdq_next(c);
 		}
+		TAILQ_FOREACH(c, &dead_clients, entry)
+			items += cmdq_next(c);
 	} while (items != 0);
 
 	server_client_loop();
@@ -394,6 +406,7 @@ server_accept(int fd, short events, __unused void *data)
 	c = server_client_create(newfd);
 	if (!server_acl_join(c)) {
 		c->exit_message = xstrdup("access not allowed");
+		c->retval = 1;
 		c->flags |= CLIENT_EXIT;
 	}
 }
@@ -441,6 +454,10 @@ server_signal(int sig)
 		server_child_signal();
 		break;
 	case SIGUSR1:
+#ifdef HAVE_SYSTEMD
+		if (systemd_activated())
+			break;
+#endif
 		event_del(&server_ev_accept);
 		fd = server_create_socket(server_client_flags, NULL);
 		if (fd != -1) {
@@ -494,6 +511,9 @@ server_child_exited(pid_t pid, int status)
 
 				log_debug("%%%u exited", wp->id);
 				wp->flags |= PANE_EXITED;
+
+				window_pane_wait_finish(wp);
+				spawn_editor_finish(wp);
 
 				if (window_pane_destroy_ready(wp))
 					server_destroy_pane(wp, 1);

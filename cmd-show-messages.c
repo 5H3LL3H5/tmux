@@ -1,4 +1,4 @@
-/* $OpenBSD$ */
+/* $OpenBSD: cmd-show-messages.c,v 1.38 2026/10/09 13:12:14 nicm Exp $ */
 
 /*
  * Copyright (c) 2009 Nicholas Marriott <nicholas.marriott@gmail.com>
@@ -36,12 +36,13 @@ static enum cmd_retval	cmd_show_messages_exec(struct cmd *,
 
 const struct cmd_entry cmd_show_messages_entry = {
 	.name = "show-messages",
+	.description = "Show server and client messages.",
 	.alias = "showmsgs",
 
 	.args = { "JTt:", 0, 0, NULL },
 	.usage = "[-JT] " CMD_TARGET_CLIENT_USAGE,
 
-	.flags = CMD_AFTERHOOK|CMD_CLIENT_TFLAG,
+	.flags = CMD_AFTERHOOK|CMD_CLIENT_TFLAG|CMD_CLIENT_CANFAIL,
 	.exec = cmd_show_messages_exec
 };
 
@@ -55,7 +56,7 @@ cmd_show_messages_terminals(struct cmd *self, struct cmdq_item *item, int blank)
 
 	n = 0;
 	LIST_FOREACH(term, &tty_terms, entry) {
-		if (args_has(args, 't') && term != tc->tty.term)
+		if (args_has(args, 't') && tc != NULL && term != tc->tty.term)
 			continue;
 		if (blank) {
 			cmdq_print(item, "%s", "");

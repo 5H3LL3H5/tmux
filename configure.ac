@@ -1,6 +1,6 @@
 # configure.ac
 
-AC_INIT([tmux], next-3.4)
+AC_INIT([tmux], next-3.9)
 AC_PREREQ([2.60])
 
 AC_CONFIG_AUX_DIR(etc)
@@ -44,7 +44,7 @@ fi
 # Set up the compiler in two different ways and say yes we may want to install.
 AC_PROG_CC
 AM_PROG_CC_C_O
-AC_PROG_CC_C99
+m4_version_prereq(2.70, [AC_PROG_CC], [AC_PROG_CC_C99])
 AC_PROG_CPP
 AC_PROG_EGREP
 AC_PROG_INSTALL
@@ -56,12 +56,29 @@ AC_USE_SYSTEM_EXTENSIONS
 test "$sysconfdir" = '${prefix}/etc' && sysconfdir=/etc
 
 # Is this --enable-debug?
-case "x$VERSION" in xnext*) enable_debug=yes;; esac
 AC_ARG_ENABLE(
 	debug,
 	AS_HELP_STRING(--enable-debug, enable debug build flags),
+	,
+	[case "x$VERSION" in xnext*) enable_debug=yes;; esac]
 )
 AM_CONDITIONAL(IS_DEBUG, test "x$enable_debug" = xyes)
+
+# Is this --enable-optimizations?
+AC_ARG_ENABLE(
+	optimizations,
+	AS_HELP_STRING(--enable-optimizations, enable optimization build flags),
+	,
+	enable_optimizations=yes
+)
+AM_CONDITIONAL(IS_OPTIMIZED, test "x$enable_optimizations" = xyes)
+
+# Is this --enable-asan?
+AC_ARG_ENABLE(
+	asan,
+	AS_HELP_STRING(--enable-asan, enable ASAN build flags)
+)
+AM_CONDITIONAL(IS_ASAN, test "x$enable_asan" = xyes)
 
 # Is this a static build?
 AC_ARG_ENABLE(
@@ -94,6 +111,17 @@ case "x$DEFAULT_TERM" in
 	;;
 esac
 
+# Allow the socket directory list to be set. It is a colon-separated list of
+# directories, tried in order; a leading $ is an environment variable.
+AC_ARG_WITH(
+	socket-path,
+	AS_HELP_STRING(--with-socket-path=PATHS, set socket directory list),
+	[TMUX_SOCK=`echo "$withval" | sed 's/[[$]]/$$/g'`],
+	[TMUX_SOCK=]
+)
+AM_CONDITIONAL(HAVE_TMUX_SOCK, [test "x$TMUX_SOCK" != x])
+AC_SUBST(TMUX_SOCK)
+
 # Do we need fuzzers?
 AM_CONDITIONAL(NEED_FUZZING, test "x$enable_fuzzing" = xyes)
 
@@ -101,13 +129,13 @@ AM_CONDITIONAL(NEED_FUZZING, test "x$enable_fuzzing" = xyes)
 AM_CONDITIONAL(IS_GCC, test "x$GCC" = xyes -a "x$enable_fuzzing" != xyes)
 
 # Is this Sun CC?
-AC_EGREP_CPP(
-	yes,
+AC_COMPILE_IFELSE([AC_LANG_SOURCE(
 	[
-		#ifdef __SUNPRO_C
-		yes
+		#ifndef __SUNPRO_C
+		#error __SUNPRO_C is not defined
 		#endif
-	],
+		int dummy;
+	])],
 	found_suncc=yes,
 	found_suncc=no
 )
@@ -148,7 +176,7 @@ AC_CHECK_FUNCS([ \
 	prctl \
 	proc_pidinfo \
 	getpeerucred \
-	sysconf \
+	sysconf
 ])
 
 # Check for functions with a compatibility implementation.
@@ -158,14 +186,15 @@ AC_REPLACE_FUNCS([ \
 	clock_gettime \
 	closefrom \
 	explicit_bzero \
-	fgetln \
 	freezero \
 	getdtablecount \
 	getdtablesize \
 	getpeereid \
 	getline \
 	getprogname \
+	htonll \
 	memmem \
+	ntohll \
 	setenv \
 	setproctitle \
 	strcasestr \
@@ -216,10 +245,11 @@ AC_SEARCH_LIBS(clock_gettime, rt)
 # musl does not set optarg to NULL for flags without arguments (although it is
 # not required to, but it is helpful) 3) there are probably other weird
 # implementations.
-AC_LIBOBJ(getopt)
+AC_LIBOBJ(getopt_long)
 
 # Look for libevent. Try libevent_core or libevent with pkg-config first then
 # look for the library.
+libevent_version=off
 PKG_CHECK_MODULES(
 	LIBEVENT_CORE,
 	[libevent_core >= 2],
@@ -228,6 +258,8 @@ PKG_CHECK_MODULES(
 		CPPFLAGS="$AM_CPPFLAGS $SAVED_CPPFLAGS"
 		LIBS="$LIBEVENT_CORE_LIBS $LIBS"
 		found_libevent=yes
+		libevent_version=`$PKG_CONFIG --modversion libevent_core 2>/dev/null`
+		test "x$libevent_version" = x && libevent_version=on
 	],
 	found_libevent=no
 )
@@ -240,6 +272,8 @@ if test x$found_libevent = xno; then
 			CPPFLAGS="$AM_CPPFLAGS $SAVED_CPPFLAGS"
 			LIBS="$LIBEVENT_LIBS $LIBS"
 			found_libevent=yes
+			libevent_version=`$PKG_CONFIG --modversion libevent 2>/dev/null`
+			test "x$libevent_version" = x && libevent_version=on
 		],
 		found_libevent=no
 	)
@@ -248,7 +282,8 @@ if test x$found_libevent = xno; then
 	AC_SEARCH_LIBS(
 		event_init,
 		[event_core event event-1.4],
-		found_libevent=yes,
+		[found_libevent=yes
+		libevent_version=on],
 		found_libevent=no
 	)
 fi
@@ -267,28 +302,39 @@ if test "x$found_libevent" = xno; then
 	AC_MSG_ERROR("libevent not found")
 fi
 
+# Look for yacc.
+AC_CHECK_PROG(found_yacc, $YACC, yes, no)
+if test "x$found_yacc" = xno; then
+	AC_MSG_ERROR("yacc not found")
+fi
+
 # Look for ncurses or curses. Try pkg-config first then directly for the
 # library.
+ncurses_version=off
 PKG_CHECK_MODULES(
-	LIBTINFO,
-	tinfo,
+	LIBTINFOW,
+	tinfow,
 	[
-		AM_CPPFLAGS="$LIBTINFO_CFLAGS $AM_CPPFLAGS"
-		CPPFLAGS="$LIBTINFO_CFLAGS $SAVED_CPPFLAGS"
-		LIBS="$LIBTINFO_LIBS $LIBS"
+		AM_CPPFLAGS="$LIBTINFOW_CFLAGS $AM_CPPFLAGS"
+		CPPFLAGS="$LIBTINFOW_CFLAGS $SAVED_CPPFLAGS"
+		LIBS="$LIBTINFOW_LIBS $LIBS"
 		found_ncurses=yes
+		ncurses_version=`$PKG_CONFIG --modversion tinfow 2>/dev/null`
+		test "x$ncurses_version" = x && ncurses_version=on
 	],
 	found_ncurses=no
 )
 if test "x$found_ncurses" = xno; then
 	PKG_CHECK_MODULES(
-		LIBNCURSES,
-		ncurses,
+		LIBTINFO,
+		tinfo,
 		[
-			AM_CPPFLAGS="$LIBNCURSES_CFLAGS $AM_CPPFLAGS"
-			CPPFLAGS="$LIBNCURSES_CFLAGS $SAVED_CPPFLAGS"
-			LIBS="$LIBNCURSES_LIBS $LIBS"
+			AM_CPPFLAGS="$LIBTINFO_CFLAGS $AM_CPPFLAGS"
+			CPPFLAGS="$LIBTINFO_CFLAGS $SAVED_CPPFLAGS"
+			LIBS="$LIBTINFO_LIBS $LIBS"
 			found_ncurses=yes
+			ncurses_version=`$PKG_CONFIG --modversion tinfo 2>/dev/null`
+			test "x$ncurses_version" = x && ncurses_version=on
 		],
 		found_ncurses=no
 	)
@@ -302,6 +348,23 @@ if test "x$found_ncurses" = xno; then
 			CPPFLAGS="$LIBNCURSESW_CFLAGS $SAVED_CPPFLAGS"
 			LIBS="$LIBNCURSESW_LIBS $LIBS"
 			found_ncurses=yes
+			ncurses_version=`$PKG_CONFIG --modversion ncursesw 2>/dev/null`
+			test "x$ncurses_version" = x && ncurses_version=on
+		],
+		found_ncurses=no
+	)
+fi
+if test "x$found_ncurses" = xno; then
+	PKG_CHECK_MODULES(
+		LIBNCURSES,
+		ncurses,
+		[
+			AM_CPPFLAGS="$LIBNCURSES_CFLAGS $AM_CPPFLAGS"
+			CPPFLAGS="$LIBNCURSES_CFLAGS $SAVED_CPPFLAGS"
+			LIBS="$LIBNCURSES_LIBS $LIBS"
+			found_ncurses=yes
+			ncurses_version=`$PKG_CONFIG --modversion ncurses 2>/dev/null`
+			test "x$ncurses_version" = x && ncurses_version=on
 		],
 		found_ncurses=no
 	)
@@ -309,8 +372,9 @@ fi
 if test "x$found_ncurses" = xno; then
 	AC_SEARCH_LIBS(
 		setupterm,
-		[tinfo ncurses ncursesw],
-		found_ncurses=yes,
+		[tinfow tinfo terminfo ncursesw ncurses],
+		[found_ncurses=yes
+		ncurses_version=on],
 		found_ncurses=no
 	)
 	if test "x$found_ncurses" = xyes; then
@@ -340,12 +404,18 @@ else
 		LIBS="$LIBS -lcurses"
 		CPPFLAGS="$CPPFLAGS -DHAVE_CURSES_H"
 		AC_DEFINE(HAVE_CURSES_H)
+		ncurses_version=on
 	else
 		AC_MSG_ERROR("curses not found")
 	fi
 fi
+AC_CHECK_FUNCS([ \
+	tiparm \
+	tiparm_s \
+])
 
 # Look for utempter.
+utempter_version=off
 AC_ARG_ENABLE(
 	utempter,
 	AS_HELP_STRING(--enable-utempter, use utempter if it is installed)
@@ -362,17 +432,46 @@ if test "x$enable_utempter" = xyes; then
 	fi
 	if test "x$enable_utempter" = xyes; then
 		AC_DEFINE(HAVE_UTEMPTER)
+		utempter_version=on
 	else
 		AC_MSG_ERROR("utempter not found")
 	fi
 fi
 
 # Look for utf8proc.
+utf8proc_version=off
 AC_ARG_ENABLE(
 	utf8proc,
 	AS_HELP_STRING(--enable-utf8proc, use utf8proc if it is installed)
 )
+try_utf8proc=no
+require_utf8proc=no
 if test "x$enable_utf8proc" = xyes; then
+	try_utf8proc=yes
+elif test "x$enable_utf8proc" = x; then
+	case "$host_os" in
+		*darwin*)
+			try_utf8proc=yes
+			require_utf8proc=yes
+			;;
+	esac
+fi
+if test "x$try_utf8proc" = xyes; then
+	SAVED_AM_CPPFLAGS="$AM_CPPFLAGS"
+	SAVED_OLD_CPPFLAGS="$CPPFLAGS"
+	SAVED_LIBS="$LIBS"
+	PKG_CHECK_MODULES(
+		LIBUTF8PROC,
+		libutf8proc,
+		[
+			AM_CPPFLAGS="$LIBUTF8PROC_CFLAGS $AM_CPPFLAGS"
+			CPPFLAGS="$AM_CPPFLAGS $SAVED_CPPFLAGS"
+			LIBS="$LIBUTF8PROC_LIBS $LIBS"
+			utf8proc_version=`$PKG_CONFIG --modversion libutf8proc 2>/dev/null`
+			test "x$utf8proc_version" = x && utf8proc_version=on
+		],
+		[:]
+	)
 	AC_CHECK_HEADER(utf8proc.h, enable_utf8proc=yes, enable_utf8proc=no)
 	if test "x$enable_utf8proc" = xyes; then
 		AC_SEARCH_LIBS(
@@ -384,13 +483,23 @@ if test "x$enable_utf8proc" = xyes; then
 	fi
 	if test "x$enable_utf8proc" = xyes; then
 		AC_DEFINE(HAVE_UTF8PROC)
+		test "x$utf8proc_version" = xoff && utf8proc_version=on
 	else
-		AC_MSG_ERROR("utf8proc not found")
+		AM_CPPFLAGS="$SAVED_AM_CPPFLAGS"
+		CPPFLAGS="$SAVED_OLD_CPPFLAGS"
+		LIBS="$SAVED_LIBS"
+		utf8proc_version=off
+		if test "x$require_utf8proc" = xyes; then
+			enable_utf8proc=
+		else
+			AC_MSG_ERROR("utf8proc not found")
+		fi
 	fi
 fi
 AM_CONDITIONAL(HAVE_UTF8PROC, [test "x$enable_utf8proc" = xyes])
 
 # Check for systemd support.
+systemd_version=off
 AC_ARG_ENABLE(
 	systemd,
 	AS_HELP_STRING(--enable-systemd, enable systemd integration)
@@ -404,6 +513,8 @@ if test x"$enable_systemd" = xyes; then
 			CPPFLAGS="$AM_CPPFLAGS $SAVED_CPPFLAGS"
 			LIBS="$SYSTEMD_LIBS $LIBS"
 			found_systemd=yes
+			systemd_version=`$PKG_CONFIG --modversion libsystemd 2>/dev/null`
+			test "x$systemd_version" = x && systemd_version=on
 		],
 		found_systemd=no
 	)
@@ -414,10 +525,95 @@ if test x"$enable_systemd" = xyes; then
 	fi
 fi
 AM_CONDITIONAL(HAVE_SYSTEMD, [test "x$found_systemd" = xyes])
+AC_ARG_ENABLE(
+	cgroups,
+	AS_HELP_STRING(--disable-cgroups, disable adding panes to new cgroups with systemd)
+)
+if test "x$enable_cgroups" = x; then
+	# Default to the same as $enable_systemd.
+	enable_cgroups=$enable_systemd
+fi
+if test "x$enable_cgroups" = xyes; then
+	if test "x$found_systemd" = xyes; then
+		AC_DEFINE(ENABLE_CGROUPS)
+	else
+		AC_MSG_ERROR("cgroups requires systemd to be enabled")
+	fi
+fi
+
+# Look for linux/keyctl.h, compat/keyring-linux.c used if found and enabled.
+AC_ARG_ENABLE(
+	keyring,
+	AS_HELP_STRING(--disable-keyring, disable giving the server its own Linux session keyring)
+)
+if test "x$enable_keyring" != xno; then
+	AC_CHECK_HEADER(linux/keyctl.h, found_keyctl=yes, found_keyctl=no)
+	if test "x$found_keyctl" = xyes; then
+		AC_DEFINE(HAVE_KEYCTL)
+	elif test "x$enable_keyring" = xyes; then
+		AC_MSG_ERROR("linux/keyctl.h not found")
+	fi
+fi
+AM_CONDITIONAL(HAVE_KEYCTL, [test "x$found_keyctl" = xyes])
+
+# Enable image support.
+libpng_version=off
+libz_version=off
+AC_ARG_ENABLE(
+	images,
+	AS_HELP_STRING(--enable-images, enable image support)
+)
+AC_ARG_ENABLE(
+	sixel,
+	AS_HELP_STRING(--enable-sixel, alias for --enable-images),
+	[
+		if test "x$enable_images" = x; then
+			enable_images=$enable_sixel
+		fi
+	]
+)
+if test "x$enable_images" = xyes; then
+	PKG_CHECK_MODULES(
+		LIBZ,
+		zlib,
+		[
+			AM_CPPFLAGS="$LIBZ_CFLAGS $AM_CPPFLAGS"
+			CPPFLAGS="$AM_CPPFLAGS $SAVED_CPPFLAGS"
+			LIBS="$LIBZ_LIBS $LIBS"
+			AC_DEFINE(HAVE_LIBZ)
+			libz_version=`$PKG_CONFIG --modversion zlib 2>/dev/null`
+			test "x$libz_version" = x && libz_version=on
+		],
+		[
+			AC_CHECK_HEADER(zlib.h, [
+				AC_CHECK_LIB(z, uncompress, [
+					LIBS="-lz $LIBS"
+					AC_DEFINE(HAVE_LIBZ)
+					libz_version=on
+				])
+			])
+		]
+	)
+	PKG_CHECK_MODULES(
+		LIBPNG,
+		[libpng >= 1.6],
+		[
+			AM_CPPFLAGS="$LIBPNG_CFLAGS $AM_CPPFLAGS"
+			CPPFLAGS="$AM_CPPFLAGS $SAVED_CPPFLAGS"
+			LIBS="$LIBPNG_LIBS $LIBS"
+			AC_DEFINE(HAVE_LIBPNG)
+			libpng_version=`$PKG_CONFIG --modversion libpng 2>/dev/null`
+			test "x$libpng_version" = x && libpng_version=on
+		],
+		[:]
+	)
+	AC_DEFINE(ENABLE_IMAGES)
+fi
+AM_CONDITIONAL(ENABLE_IMAGES, [test "x$enable_images" = xyes])
 
 # Check for b64_ntop. If we have b64_ntop, we assume b64_pton as well.
 AC_MSG_CHECKING(for b64_ntop)
-	AC_LINK_IFELSE([AC_LANG_PROGRAM(
+AC_LINK_IFELSE([AC_LANG_PROGRAM(
 	[
 		#include <sys/types.h>
 		#include <netinet/in.h>
@@ -502,35 +698,91 @@ if test "x$found_malloc_trim" = xyes; then
 	AC_DEFINE(HAVE_MALLOC_TRIM)
 fi
 
+# Build against jemalloc if requested.
+jemalloc_version=off
+AC_ARG_ENABLE(
+	jemalloc,
+	AS_HELP_STRING(--enable-jemalloc, use jemalloc if it is installed)
+)
+try_jemalloc=no
+require_jemalloc=no
+if test "x$enable_asan" = xyes && test "x$enable_jemalloc" = xyes; then
+	AC_MSG_ERROR([--enable-asan and --enable-jemalloc cannot be used together])
+fi
+if test "x$enable_jemalloc" = xyes; then
+	try_jemalloc=yes
+elif test "x$enable_jemalloc" = x; then
+	case "$host_os" in
+		*darwin*)
+			if test "x$enable_asan" = xyes; then
+				enable_jemalloc=no
+			else
+				try_jemalloc=yes
+				require_jemalloc=yes
+			fi
+			;;
+	esac
+fi
+if test "x$try_jemalloc" = xyes; then
+	SAVED_AM_CPPFLAGS="$AM_CPPFLAGS"
+	SAVED_OLD_CPPFLAGS="$CPPFLAGS"
+	SAVED_LIBS="$LIBS"
+	PKG_CHECK_MODULES(
+		JEMALLOC,
+		jemalloc,
+		[
+			AM_CPPFLAGS="$JEMALLOC_CFLAGS $AM_CPPFLAGS"
+			CPPFLAGS="$AM_CPPFLAGS $SAVED_CPPFLAGS"
+			LIBS="$LIBS $JEMALLOC_LIBS"
+			jemalloc_version=`$PKG_CONFIG --modversion jemalloc 2>/dev/null`
+			test "x$jemalloc_version" = x && jemalloc_version=on
+		],
+		enable_jemalloc=no
+	)
+	if test "x$enable_jemalloc" = xno; then
+		AM_CPPFLAGS="$SAVED_AM_CPPFLAGS"
+		CPPFLAGS="$SAVED_OLD_CPPFLAGS"
+		LIBS="$SAVED_LIBS"
+		jemalloc_version=off
+		if test "x$require_jemalloc" = xyes; then
+			enable_jemalloc=
+		else
+			AC_MSG_ERROR("jemalloc not found")
+		fi
+	else
+		enable_jemalloc=yes
+		AC_DEFINE(HAVE_JEMALLOC)
+		test "x$jemalloc_version" = xoff && jemalloc_version=on
+	fi
+fi
+
 # Check for CMSG_DATA. On some platforms like HP-UX this requires UNIX 95
 # (_XOPEN_SOURCE and _XOPEN_SOURCE_EXTENDED) (see xopen_networking(7)). On
 # others, UNIX 03 (_XOPEN_SOURCE 600, see standards(7) on Solaris).
 XOPEN_DEFINES=
 AC_MSG_CHECKING(for CMSG_DATA)
-AC_EGREP_CPP(
-	yes,
+AC_COMPILE_IFELSE([AC_LANG_SOURCE(
 	[
 		#include <sys/socket.h>
-		#ifdef CMSG_DATA
-		yes
+		#ifndef CMSG_DATA
+		#error CMSG_DATA is not defined
 		#endif
-	],
+	])],
 	found_cmsg_data=yes,
 	found_cmsg_data=no
 )
 AC_MSG_RESULT($found_cmsg_data)
 if test "x$found_cmsg_data" = xno; then
 	AC_MSG_CHECKING(if CMSG_DATA needs _XOPEN_SOURCE_EXTENDED)
-	AC_EGREP_CPP(
-		yes,
+	AC_COMPILE_IFELSE([AC_LANG_SOURCE(
 		[
 			#define _XOPEN_SOURCE 1
 			#define _XOPEN_SOURCE_EXTENDED 1
 			#include <sys/socket.h>
-			#ifdef CMSG_DATA
-			yes
+			#ifndef CMSG_DATA
+			#error CMSG_DATA is not defined
 			#endif
-		],
+		])],
 		found_cmsg_data=yes,
 		found_cmsg_data=no
 	)
@@ -541,15 +793,14 @@ if test "x$found_cmsg_data" = xno; then
 fi
 if test "x$found_cmsg_data" = xno; then
 	AC_MSG_CHECKING(if CMSG_DATA needs _XOPEN_SOURCE 600)
-	AC_EGREP_CPP(
-		yes,
+	AC_COMPILE_IFELSE([AC_LANG_SOURCE(
 		[
 			#define _XOPEN_SOURCE 600
 			#include <sys/socket.h>
-			#ifdef CMSG_DATA
-			yes
+			#ifndef CMSG_DATA
+			#error CMSG_DATA is not defined
 			#endif
-		],
+		])],
 		found_cmsg_data=yes,
 		found_cmsg_data=no
 	)
@@ -573,9 +824,9 @@ else
 	AC_LIBOBJ(err)
 fi
 
-# Look for imsg_init in libutil.
-AC_SEARCH_LIBS(imsg_init, util, found_imsg_init=yes, found_imsg_init=no)
-if test "x$found_imsg_init" = xyes; then
+# Look for imsg_add in libutil.
+AC_SEARCH_LIBS(imsg_add, util, found_imsg_add=yes, found_imsg_add=no)
+if test "x$found_imsg_add" = xyes; then
 	AC_DEFINE(HAVE_IMSG)
 else
 	AC_LIBOBJ(imsg)
@@ -846,6 +1097,20 @@ case "$host_os" in
 			AC_MSG_NOTICE([])
 			AC_MSG_ERROR([must give --enable-utf8proc or --disable-utf8proc])
 		fi
+		#
+		# macOS calloc(3) does not appear to always zero memory correctly,
+		# so complain and suggest using jemalloc instead.
+		#
+		if test "x$enable_jemalloc" = x; then
+			AC_MSG_NOTICE([])
+			AC_MSG_NOTICE([	   macOS calloc(3) appears not to correctly])
+			AC_MSG_NOTICE([	   zero allocations in some circumstances;])
+			AC_MSG_NOTICE([	   to avoid this, configuring with])
+			AC_MSG_NOTICE([	   --enable-jemalloc is recommended. To build])
+			AC_MSG_NOTICE([	   without anyway, use --disable-jemalloc])
+			AC_MSG_NOTICE([])
+			AC_MSG_ERROR([must give --enable-jemalloc or --disable-jemalloc])
+		fi
 		;;
 	*dragonfly*)
 		AC_MSG_RESULT(dragonfly)
@@ -880,8 +1145,13 @@ case "$host_os" in
 				MANFORMAT=mdoc
 				;;
 			*)
-				# Solaris 2.0 to 11.3 use AT&T nroff.
-				MANFORMAT=man
+				if test `uname -o 2>/dev/null` = illumos; then
+					# Illumos uses mandoc.
+					MANFORMAT=mdoc
+				else
+					# Solaris 2.0 to 11.3 use AT&T nroff.
+					MANFORMAT=man
+				fi
 				;;
 		esac
 		;;
@@ -912,8 +1182,48 @@ AM_CONDITIONAL(IS_NETBSD, test "x$PLATFORM" = xnetbsd)
 AM_CONDITIONAL(IS_OPENBSD, test "x$PLATFORM" = xopenbsd)
 AM_CONDITIONAL(IS_SUNOS, test "x$PLATFORM" = xsunos)
 AM_CONDITIONAL(IS_HPUX, test "x$PLATFORM" = xhpux)
+AM_CONDITIONAL(IS_CYGWIN, test "x$PLATFORM" = xcygwin)
 AM_CONDITIONAL(IS_HAIKU, test "x$PLATFORM" = xhaiku)
 AM_CONDITIONAL(IS_UNKNOWN, test "x$PLATFORM" = xunknown)
+
+# Set the default lock command
+DEFAULT_LOCK_CMD="lock -np"
+if test "x$PLATFORM" = xlinux; then
+	AC_CHECK_PROG(found_vlock, vlock, yes, no)
+	if test "x$found_vlock" = xyes; then
+		DEFAULT_LOCK_CMD="vlock"
+	fi
+fi
+AC_MSG_CHECKING(lock-command)
+AC_MSG_RESULT($DEFAULT_LOCK_CMD)
+AC_SUBST(DEFAULT_LOCK_CMD)
+
+# Print a summary.
+AC_MSG_NOTICE([])
+if test "x$enable_asan" = xyes; then
+	AC_MSG_NOTICE([ASAN: on])
+else
+	AC_MSG_NOTICE([ASAN: off])
+fi
+if test "x$enable_images" = xyes; then
+	AC_MSG_NOTICE([images: on])
+else
+	AC_MSG_NOTICE([images: off])
+fi
+if test "x$enable_debug" = xyes; then
+	AC_MSG_NOTICE([debug: on])
+else
+	AC_MSG_NOTICE([debug: off])
+fi
+AC_MSG_NOTICE([jemalloc: $jemalloc_version])
+AC_MSG_NOTICE([libevent: $libevent_version])
+AC_MSG_NOTICE([libpng: $libpng_version])
+AC_MSG_NOTICE([libz: $libz_version])
+AC_MSG_NOTICE([ncurses: $ncurses_version])
+AC_MSG_NOTICE([systemd: $systemd_version])
+AC_MSG_NOTICE([utempter: $utempter_version])
+AC_MSG_NOTICE([utf8proc: $utf8proc_version])
+AC_MSG_NOTICE([])
 
 # Save our CFLAGS/CPPFLAGS/LDFLAGS for the Makefile and restore the old user
 # variables.
